@@ -1,0 +1,73 @@
+{
+  "skipFilesModifiedWithinHours": 24,
+  "verify": "size",
+  "logDir": "logs",
+  "logRetentionDays": 7,
+  "copyMarginGB": 0.2,
+  "maxUnitPctOfFree": 50,
+  "sinkOrder": "bestFit",
+  "unitOrder": "smallestFirst",
+  "statusDisplayOrder": ["C:", "K:", "D:", "F:", "G:", "H:", "J:"],
+  "driveErrorWindowHours": 24,
+  "recycleReclaim": true,
+
+  "libraries": [
+    {
+      "name": "Movies",
+      "unit": "file",
+      "roots": [
+        "C:\\Users\\YOURNAME\\Downloads\\Movies",
+        "D:\\Movies",
+        "F:\\Movies",
+        "G:\\Movies",
+        "H:\\Movies",
+        "J:\\Movies",
+        "K:\\Movies"
+      ],
+      "mediaExtensions": [".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv"]
+    },
+    {
+      "name": "TV",
+      "unit": "show",
+      "roots": [
+        "C:\\Users\\YOURNAME\\Downloads\\TV",
+        "D:\\TV",
+        "F:\\TV",
+        "G:\\TV",
+        "H:\\TV",
+        "J:\\TV",
+        "K:\\TV"
+      ],
+      "mediaExtensions": [".mkv", ".mp4", ".avi", ".m4v"]
+    }
+  ],
+
+  "drives": {
+    "C:": {
+      "comment": "landing zone - downloads land here first, so it keeps the most free space",
+      "sources": true,
+      "priority": 1,
+      "drain": "always",
+      "downloadSignalGB": 250
+    },
+    "D:": { "comment": "internal SATA - receives from C: and K:, fill to the brim, then cascades onward", "sources": true, "alsoSink": true, "priority": 3, "maxFillPct": 95, "targetFreePct": 0.1 },
+    "F:": { "comment": "the parking lot. Last in the chain: takes content from the drive before it only to free that drive for upstream.", "sources": false, "alsoSink": true, "priority": 5, "maxFillPct": 95, "targetFreePct": 0.1 },
+    "G:": { "comment": "internal NVMe - receives from C:, K: and D:, fill to the brim, then cascades to F:", "sources": true, "alsoSink": true, "priority": 4, "maxFillPct": 95, "targetFreePct": 0.1 },
+    "H:": { "comment": "USB exFAT - exempt from the 50% rule because exFAT reports slack", "sources": false, "targetFreePct": 1.0, "exemptHeadroomRule": true },
+    "J:": {
+      "comment": "small exFAT stick - small units only, still fill it, exempt from the 50% rule",
+      "sources": false,
+      "targetFreeGB": 2,
+      "maxUnitGB": 8,
+      "exemptHeadroomRule": true
+    },
+    "K:": {
+      "comment": "USB drive - accepts from C: when it has room.",
+      "sources": false,
+      "drain": "always",
+      "alsoSink": true,
+      "priority": 2,
+      "targetFreePct": 0.5
+    }
+  }
+}

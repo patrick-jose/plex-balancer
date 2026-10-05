@@ -1,0 +1,29 @@
+# Logs: one JSONL per day plus the watcher log, all named by date, all pruned by
+# logRetentionDays. Nothing here is worth keeping and a year of it names every
+# file you have ever moved.
+logs/*
+
+# Working copies, .bak snapshots and scratch diagnostics. Nothing here is part of
+# the tool - it is what you keep while changing something and delete when it is
+# done. Ignored so none of it can reach a published repo.
+backup/*
+
+# Your policy, not the project's. It names your drive letters, your library paths
+# and your account, so it stays on this machine. Copy config.example.json to
+# config.json and edit that instead - the scripts look for config.json and fall
+# back to the example if it is missing.
+config.json
+
+# Balancer runtime state, and the give-back ledger. Both are per-machine: state
+# holds a pid and a phase, and the ledger records what this machine gave back.
+logs/state.json
+logs/givenback.json
+
+# Nothing should land here, but a killed copy can leave a .tmp next to a ledger
+# that a crash prevented from being renamed into place.
+*.tmp
+
+# Editor state. Created by whatever editor you opened the folder in, and specific
+# to this machine - it records which commands you have approved. Nobody else wants
+# it, and 'git add -A' would otherwise pick it up on its own.
+.vscode/
