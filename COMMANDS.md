@@ -25,6 +25,7 @@ to.
 
 | File | Purpose |
 |---|---|
+| `README.md` | The front door: what it is, how to run it, and the decisions worth knowing. Start there; this file is the reference. |
 | `balance.ps1` | The worker. Plans and performs moves. |
 | `watch.ps1` | Poller. Runs reconcile, prunes expired logs, then balance when room appears. |
 | `reconcile.ps1` | Repairs runs that were interrupted mid-copy. |
@@ -913,6 +914,13 @@ Honest list of what is incomplete or worth knowing:
 - **A failing drive can still be written to while it is failing.** The gate in
   [Failing drives](#failing-drives) protects reads only. This is the one gap left
   in the incident, and it is deliberate - see above.
+- **`verify` in `config.json` is inert.** It is documented above as the default
+  verification method, and it looks like it should work, but nothing reads it.
+  The real control is the `-Hash` switch on `balance.ps1`: without it, verification
+  is size plus file count; with it, SHA256. Setting `"verify": "hash"` in the
+  config and running without `-Hash` gets you size verification silently. This is
+  the same class of thing as `-MaxMinutes` and `-LookbackDays` below - a declared
+  parameter nothing reads. Use `-Hash` and ignore the key.
 - **The 2026-10-03 raw logs are gone.** `watch-20261003.log`, `moves-20261003.jsonl`
   and `reconcile-20261003.jsonl` (and the same three for 2026-10-04) were deleted
   on 2026-10-05 by mistake, five days before retention at its current setting of
