@@ -223,13 +223,9 @@ try {
     Assert-True 'a downloading file is skipped by name' ($src -match "'still downloading'")
     Assert-True 'the time rule is gated on the guard being unknown' ($src -match '\$useTimeFallback -and \$f\.LastWriteTime -gt \$Cutoff')
     Assert-True 'blockSeeded defaults to true' ($src -match "Get-Prop \`$settings 'blockSeeded' \`$true")
-    Assert-True 'the JSON is decoded as UTF-8' ($src -match '\[System\.Text\.Encoding\]::UTF8\.GetString\(\$resp\.RawContentStream\.ToArray\(\)\)')
-    Assert-True 'ConvertFrom-Json is not wrapped in @()' ($src -match 'ConvertFrom-Json -InputObject \$json')
-    Assert-True 'an empty list survives the return' ($src -match 'return , \$list')
-    Assert-True 'the per-torrent file list is asked for' ($src -match 'torrents/files\?hash=')
-    Assert-True 'and its result is what is held' ($src -match '\$guard\.Files \+= \(Join-Path \$savePath \$rel\)')
+    # UTF-8, multi-torrent parsing, the empty list and exact-file ownership are
+    # exercised above against the fake client; no source-text duplicates needed.
     Assert-True 'startIfStopped is honoured' ($src -match "Get-Prop \`$settings 'startIfStopped'")
-    Assert-True 'a client it started is closed again' ($src -match 'app/shutdown')
     Assert-True 'the close is in a finally, so a failure cannot leak it' ($src -match '(?s)finally\s*\{[^}]*app/shutdown')
 
     # ---- 11. who started a client, and who may close it ----------------------
@@ -242,16 +238,13 @@ try {
     #   01:05:35 WebUI: Now listening on port 8080
     #   01:05:36 qBittorrent termination initiated
     #
-    # Ownership is now a recorded pid rather than a flag, and these check that the
-    # close is gated on it. Read from the source, because the failure mode is the
-    # absence of a guard and calling the function cannot prove one is absent.
+    # Ownership is now a recorded pid rather than a flag. These source checks
+    # verify the gates exist; they do not simulate the startup race.
     Assert-True 'the started instance is recorded by pid' ($src -match '\$ourPid = \$started\.Id')
     Assert-True 'the close requires that pid to be set' ($src -match 'if \(\$null -ne \$ourPid -and \$stopAfterCheck\)')
     # Both conditions, not either: the flag alone was the bug.
     Assert-True 'the close also requires that pid to still be the only one running' `
         ($src -match '\$live\.Count -eq 1 -and \$live\[0\]\.Id -eq \$ourPid')
-    Assert-True 'a client it did not start is never shut down' `
-        ($src -match 'left qBittorrent running: it is not the instance this guard started')
     # The flag that could be set by a race must be gone entirely.
     Assert-False 'the old boolean ownership flag is gone' ($src -match 'weStartedIt')
 

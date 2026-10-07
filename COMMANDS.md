@@ -489,15 +489,15 @@ about themselves, and stops if any fails:
 ```
 CHECK  preflight
 --------------------------------------------------------------------------
-  ok   18 script(s) parse
-  ok   13 test file(s) are pure ASCII
+  ok   17 script(s) parse
+  ok   12 test file(s) are pure ASCII
   ok   config.example.json parses; local config.json present
 
 SUMMARY
 --------------------------------------------------------------------------
-  PASS cascade-direction      28 ok    0 failed       1s
+  PASS cascade-direction      40 ok    0 failed     1,3s
   PASS disk-identity          28 ok    0 failed     1,4s
-  PASS download-guard         54 ok    0 failed     7,1s
+  PASS download-guard         47 ok    0 failed    13,1s
   PASS drive-health           15 ok    0 failed     2,6s
   PASS recycle-bin            93 ok    0 failed     2,4s
   PASS retention              36 ok    0 failed     1,2s
@@ -506,7 +506,7 @@ SUMMARY
   PASS verify-mode            27 ok    0 failed     0,9s
   PASS watchdog               16 ok    0 failed     6,4s
 
-  10 suite(s) run, 371 checks reported (371 ok, 0 failed)
+  10 suite(s) run, 357 checks reported (357 ok, 0 failed)
   PASS - every suite reported success
 ```
 
@@ -524,7 +524,7 @@ Three outcomes the summary will not confuse with each other:
 |---|---|
 | `tests\cascade-direction.ps1` | Which directions the cascade allows, and that the parking lot does not slide to another drive when the last drive is absent. |
 | `tests\disk-identity.ps1` | Attributing a disk error to the drive that actually caused it when Windows has reassigned disk numbers: the exact 2026-10-06 misattribution, and the limit that errors already logged cannot be re-resolved. |
-| `tests\download-guard.ps1` | The [download guard](#the-download-guard): that a finished torrent still blocks, that a prefix is matched on a separator boundary, that the UTF-8 decode and the unwrapped `ConvertFrom-Json` survive, and that an unreachable client falls back instead of failing open. Also that **only a client the guard started itself is ever closed** - ownership by pid, not by a flag that a startup race could set wrongly, which is the bug that closed a Windows-started client on 2026-10-07. Talks to `tests\_fake-qbittorrent.ps1`; never touches the real client. |
+| `tests\download-guard.ps1` | The [download guard](#the-download-guard): that a finished torrent still blocks, that a prefix is matched on a separator boundary, that the UTF-8 decode and multi-torrent parsing survive, and that an unreachable client falls back instead of failing open. Source checks cover the PID-based shutdown gate added after a startup race closed a Windows-started client on 2026-10-07; these checks do **not** simulate that race. Talks to `tests\_fake-qbittorrent.ps1`; never touches the real client. |
 | `tests\drive-health.ps1` | Reading a disk number out of a Windows error message in both English and Portuguese, and mapping a drive letter to a physical disk. |
 | `tests\shed-gate.ps1` | The demand gate on the last drive: that it blocks when nothing is waiting, opens when something is, and **cannot grant a move the direction check refused** — asserted with the demand figure set absurdly high, which is the ping-pong that happened on 2026-10-06. |
 | `tests\recycle-bin.ps1` | Reading an item's origin out of its `$I` record, including two real header layouts with the paths swapped for invented ones, every shape that must be *refused*, and the whole pass over a throwaway `subst` volume. |

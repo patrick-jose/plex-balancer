@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $cfgPath)) {
 }
 $cfg = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 
-. (Lift-Functions -Script 'balance.ps1' -Names @('Get-Prop', 'Test-Forward', 'Test-Shed'))
+. (Lift-Functions -Script 'balance.ps1' -Names @('Get-Prop', 'Test-Forward'))
 ''
 # Rebuild the drive objects exactly as balance.ps1 does, then apply the IsLast
 # marking from the NEW config-derived chainMax. Priority 99 / InCascade false is
@@ -166,35 +166,9 @@ foreach ($a in $chained) {
 }
 Assert-Equal 'no prioritised drive may move content to an earlier one' ($backwards -join ', ') ''
 
-# G: is the specific case that caused the ping-pong on 2026-10-06. Spelled out on
-# its own so a regression names itself rather than showing up as a list difference.
-Assert-False 'G: cannot reach F: (the one that ping-ponged)' `
-    (Test-Forward -From $byLetter['G:'] -To $byLetter['F:'])
+# Demand-gate cases, including G: -> F: under pressure, live in shed-gate.ps1.
 
-# ---- 4. the demand gate on the last drive ----------------------------------
-# G: is the end of the chain, so it accepts from F: only when something is
-# actually waiting for room on F:. Without that, F: would spend every run
-# relocating its own library into a drive that has nowhere to pass it onward.
-# It gates RECEIVING only; it grants no backwards move, because Test-Forward
-# already refused those before this gate was reached.
-$candidates = @('D:', 'F:', 'K:', 'H:', 'J:', 'G:')
-
-$noDemand = @($candidates | Where-Object { Test-Shed -From $byLetter['F:'] -To $byLetter[$_] -Demand @{} })
-Assert-True  "F: -> G: blocked while nothing waits on F:" ('G:' -notin $noDemand)
-
-$withDemand = @($candidates | Where-Object { Test-Shed -From $byLetter['F:'] -To $byLetter[$_] -Demand @{ 'F:' = 3 } })
-Assert-True  "F: -> G: allowed when F: is waiting for room" ('G:' -in $withDemand)
-
-# The same question asked of G: as a source. H: and J: are outside the chain so
-# they stay reachable; F:, D: and K: are refused no matter what the demand says,
-# because the gate adds a restriction and can never undo the direction check.
-$fromG = @($candidates | Where-Object { Test-Shed -From $byLetter['G:'] -To $byLetter[$_] -Demand @{ 'G:' = 99 } })
-Assert-False "G: -> F: refused even with demand waiting on G:" ('F:' -in $fromG)
-Assert-False "G: -> D: refused even with demand waiting on G:" ('D:' -in $fromG)
-Assert-True  "G: -> H: still reachable, it is outside the chain" ('H:' -in $fromG)
-Assert-True  "G: -> J: still reachable, it is outside the chain" ('J:' -in $fromG)
-
-# ---- 5. a drive with no priority stays unrestricted -------------------------
+# ---- 4. a drive with no priority stays unrestricted -------------------------
 $loose = New-Drive 'Z:'
 Assert-True "no priority on the source -> unrestricted" (Test-Forward -From $loose -To $byLetter['C:'])
 
