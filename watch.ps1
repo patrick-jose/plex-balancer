@@ -78,12 +78,19 @@ function Get-Prop {
 }
 
 # Free space a sink should keep once it is full: absolute or percentage.
+#
+# Tested against $null, not truthiness - the same reasoning and the same fix as
+# Get-SinkTargetFree in balance.ps1. "if ($abs)" is false for 0, so a target of
+# exactly 0 (which is what D:, F:, G:, H: and J: are set to, to fill completely)
+# fell through both branches and reached "return 0.0" by accident. The number was
+# right and nothing checked that it was reached on purpose, which is exactly how
+# "fill to the brim" turns into "fall back to a default" unnoticed.
 function Get-TargetFree {
     param($Cfg, [double]$Total)
     $abs = Get-Prop $Cfg 'targetFreeGB'
-    if ($abs) { return [double]$abs * $GB }
+    if ($null -ne $abs) { return [double]$abs * $GB }
     $pct = Get-Prop $Cfg 'targetFreePct'
-    if ($pct) { return $Total * [double]$pct / 100 }
+    if ($null -ne $pct) { return $Total * [double]$pct / 100 }
     return 0.0
 }
 

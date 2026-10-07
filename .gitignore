@@ -14,10 +14,13 @@ backup/*
 # back to the example if it is missing.
 config.json
 
-# Balancer runtime state, and the give-back ledger. Both are per-machine: state
-# holds a pid and a phase, and the ledger records what this machine gave back.
+# Balancer runtime state, and the disk-identity map the failing-drive gate writes.
+# Both are per-machine: state holds a pid and a phase, and diskmap records which
+# physical disk held each failing disk number.
+#
+# logs/givenback.json used to be here, for the give-back ledger. The give-back is
+# gone - nothing moves backwards - so nothing writes that file any more.
 logs/state.json
-logs/givenback.json
 
 # Nothing should land here, but a killed copy can leave a .tmp next to a ledger
 # that a crash prevented from being renamed into place.

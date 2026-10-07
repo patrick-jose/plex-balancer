@@ -11,12 +11,48 @@
 # Global\PlexBalancer re-acquires it successfully and WaitOne reports success, so
 # testing the in-flight case on the same thread that holds the mutex falsely
 # reports "idle". The in-flight check below therefore uses a separate process.
+#
+# The second trap is this suite's own. Test-RunInFlight answers one question -
+# "is the real balancer mutex held right now?" - and the checks below assert on
+# the ANSWER, including asserting it is free. A scheduled run that starts while
+# this suite is executing holds that same mutex, so those assertions fail for a
+# reason that has nothing to do with the code under test. Observed on 2026-10-07:
+# the hourly task fired at 00:40 mid-suite and two checks failed with "a run is in
+# flight" while the watcher was working perfectly. A suite that fails for reasons
+# outside its control is one you learn to ignore, which costs more than it buys.
+#
+# So the suite waits for the machine to be quiet before touching anything, and
+# reports SKIPPED - distinctly from passing and from failing - if it never gets
+# that. Exit code 3 means skipped; Run-Tests.ps1 treats that as its own outcome
+# rather than folding it into the verdict.
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_helpers.ps1')
 
 . (Lift-Functions -Script 'watch.ps1' -Names @('Write-WatchLog', 'Invoke-Child', 'Test-RunInFlight'))
 ''
+
+# ---- 0. wait for the balancer to be idle -------------------------------------
+# Bounded, and it says so while it waits, so a long pause is visibly a wait and
+# not a hang. The default is longer than a normal run because the run that started
+# a minute ago may be a long one: the recorded deadline is 1800s.
+$quietWaitSeconds = if ($env:PB_TEST_QUIET_WAIT) { [int]$env:PB_TEST_QUIET_WAIT } else { 1800 }
+if (Test-RunInFlight) {
+    "waiting up to ${quietWaitSeconds}s for the balancer to finish - it is running now"
+    $waited = 0
+    while ($waited -lt $quietWaitSeconds -and (Test-RunInFlight)) {
+        Start-Sleep -Seconds 5
+        $waited += 5
+    }
+}
+
+if (Test-RunInFlight) {
+    "SKIPPED: the balancer has been running for over ${quietWaitSeconds}s and still holds"
+    "         Global\PlexBalancer. This suite asserts on whether that mutex is free, so it"
+    "         cannot run alongside a real one without failing for the wrong reason."
+    "         Re-run it when the machine is idle, or lower PB_TEST_QUIET_WAIT."
+    exit 3
+}
 
 $tmp = Join-Path $env:TEMP ('pbwatch-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
@@ -118,11 +154,23 @@ finally {
 }
 
 # ---- 9. and it clears once that process is gone ------------------------------
-for ($i = 0; $i -lt 25; $i++) {
-    if (-not (Test-RunInFlight)) { break }
+# Waits rather than asserting immediately: the killed holder releases the mutex in
+# the kernel, but the process object can take a moment to be reaped, and a fixed
+# sleep here used to be a race that only lost when the machine was busy.
+$cleared = $false
+for ($i = 0; $i -lt 50; $i++) {
+    if (-not (Test-RunInFlight)) { $cleared = $true; break }
     Start-Sleep -Milliseconds 200
 }
-Assert-False 'the mutex is free again once the run ends' (Test-RunInFlight)
+Assert-True 'the mutex is free again once the run ends' $cleared
+
+# ---- 10. the machine is still idle after the suite ---------------------------
+# The suite took a real mutex and released it. If a scheduled run started and
+# finished in the meantime that is legitimate and not this suite's business, so
+# this asserts only what the suite is responsible for: that it left nothing
+# holding the mutex itself. $held is dead by now, so a "still busy" here means
+# something leaked.
+Assert-Equal 'the suite left nothing holding the mutex' (Test-RunInFlight) $false
 
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 Write-TestResult -Suite 'watchdog'

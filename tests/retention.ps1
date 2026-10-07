@@ -115,7 +115,7 @@ try {
     # The blast radius is the whole point: this must never be able to reach media,
     # and it cannot, because it looks at files directly inside logs\ and only
     # ones named moves/watch/reconcile-<date>.(jsonl|log).
-    foreach ($name in @('state.json', 'givenback.json', 'moves-backup.jsonl',
+    foreach ($name in @('state.json', 'diskmap.json', 'moves-backup.jsonl',
             'watch-20261001.log.bak', 'archive-moves-20261001.jsonl', 'notes.txt')) {
         [System.IO.File]::WriteAllText((Join-Path $root $name), 'x')
     }
@@ -124,7 +124,7 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $sub 'moves-20260101.jsonl'), 'x')
 
     $null = Invoke-Prune -Days 1
-    foreach ($name in @('state.json', 'givenback.json', 'moves-backup.jsonl',
+    foreach ($name in @('state.json', 'diskmap.json', 'moves-backup.jsonl',
             'watch-20261001.log.bak', 'archive-moves-20261001.jsonl', 'notes.txt')) {
         Assert-True "never pruned: $name" (Test-Path -LiteralPath (Join-Path $root $name))
     }

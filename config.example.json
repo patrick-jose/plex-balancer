@@ -11,6 +11,18 @@
   "driveErrorWindowHours": 24,
   "recycleReclaim": true,
 
+  "downloadGuard": {
+    "enabled": true,
+    "url": "http://127.0.0.1:8080",
+    "timeoutSeconds": 10,
+    "blockSeeded": true,
+    "startIfStopped": true,
+    "stopAfterCheck": true,
+    "exePath": "C:\\Program Files\\qBittorrent\\qbittorrent.exe",
+    "startTimeoutSeconds": 90,
+    "bootGraceSeconds": 300
+  },
+
   "libraries": [
     {
       "name": "Movies",
@@ -50,24 +62,51 @@
       "drain": "always",
       "downloadSignalGB": 250
     },
-    "D:": { "comment": "internal SATA - receives from C: and K:, fill to the brim, then cascades onward", "sources": true, "alsoSink": true, "priority": 3, "maxFillPct": 95, "targetFreePct": 0.1 },
-    "F:": { "comment": "the parking lot. Last in the chain: takes content from the drive before it only to free that drive for upstream.", "sources": false, "alsoSink": true, "priority": 5, "maxFillPct": 95, "targetFreePct": 0.1 },
-    "G:": { "comment": "internal NVMe - receives from C:, K: and D:, fill to the brim, then cascades to F:", "sources": true, "alsoSink": true, "priority": 4, "maxFillPct": 95, "targetFreePct": 0.1 },
-    "H:": { "comment": "USB exFAT - exempt from the 50% rule because exFAT reports slack", "sources": false, "targetFreePct": 1.0, "exemptHeadroomRule": true },
-    "J:": {
-      "comment": "small exFAT stick - small units only, still fill it, exempt from the 50% rule",
-      "sources": false,
-      "targetFreeGB": 2,
-      "maxUnitGB": 8,
-      "exemptHeadroomRule": true
-    },
     "K:": {
-      "comment": "USB drive - accepts from C: when it has room.",
-      "sources": false,
+      "comment": "USB drive - takes from C:, pushes to D:, F:, G:, H: and J:. A source again as of 2026-10-06; it was held back because Windows was blaming this disk for errors that belonged to a different one. It logged 44,249 paging errors and 2,623 hardware I/O failures in September, so if it starts reporting errors again it will be held out of reads once more.",
+      "sources": true,
       "drain": "always",
       "alsoSink": true,
       "priority": 2,
       "targetFreePct": 0.5
+    },
+    "D:": {
+      "comment": "internal SATA - receives from C: and K:, fill to the brim, then cascades to F:, G:, H: and J:",
+      "sources": true,
+      "alsoSink": true,
+      "priority": 3,
+      "maxFillPct": 95,
+      "targetFreePct": 0
+    },
+    "F:": {
+      "comment": "USB 1TB - takes from C:, K: and D:, then pushes to G:, H: and J:. Was the parking lot until 2026-10-06, when it became a source again so the chain can reach J: at all.",
+      "sources": true,
+      "alsoSink": true,
+      "priority": 4,
+      "maxFillPct": 95,
+      "targetFreePct": 0
+    },
+    "G:": {
+      "comment": "internal NVMe - receives from C:, K:, D: and F:, fill to the brim, then cascades to H: and J:. Last in the chain, so it is the parking lot as a receiver; it still pushes outward to the exFAT volumes, which sit outside the chain.",
+      "sources": true,
+      "alsoSink": true,
+      "priority": 5,
+      "maxFillPct": 95,
+      "targetFreePct": 0
+    },
+    "H:": {
+      "comment": "USB 2TB exFAT - takes from C:, K:, D:, F: and G:, pushes to J:. A source again as of 2026-10-06; it was held back only because Windows blamed it for another disk's errors. Exempt from the 50% rule because exFAT reports slack.",
+      "sources": true,
+      "alsoSink": true,
+      "targetFreePct": 0,
+      "exemptHeadroomRule": true
+    },
+    "J:": {
+      "comment": "116 GB exFAT stick - end of the chain, small files only, still fill it, exempt from the 50% rule",
+      "sources": false,
+      "targetFreeGB": 0,
+      "maxUnitGB": 8,
+      "exemptHeadroomRule": true
     }
   }
 }

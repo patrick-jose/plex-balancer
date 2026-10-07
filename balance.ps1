@@ -66,7 +66,7 @@ if (-not $held) {
 }
 
 # Must be read as UTF-8 explicitly. PS 5.1's default is ANSI, which turns the
-# accent in "Séries" into garbage and makes every series root stop existing.
+# accent in a series root into garbage, making every series root stop existing.
 $cfg = [System.IO.File]::ReadAllText($ConfigPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 $GB = 1GB
 $logDir = if ($cfg.logDir) { Join-Path $PSScriptRoot $cfg.logDir } else { $PSScriptRoot }
@@ -116,6 +116,36 @@ function Get-Prop {
     return $p.Value
 }
 
+# Which of the two verification methods this run uses. "size" compares the copied
+# file count and total length; "hash" compares SHA256 of every file. Both happen
+# before the source is deleted, so this decides how much confidence the move is
+# worth, not whether it happens at all.
+#
+# It used to be a config key that nothing read, which was the worst kind of
+# documentation: "verify": "hash" in config.json looked like it should turn hashing
+# on, and it did not. The key is honoured now, and an unrecognised value is an
+# error rather than a silent fallback - guessing here would quietly downgrade the
+# check, and "size" is the guess that gets guessed.
+#
+# The command line wins in both directions. -Hash forces hashing even when the
+# config says size, and -Hash:$false forces size even when the config says hash,
+# because an explicitly bound switch is distinguishable from an unset one.
+function Resolve-VerifyMode {
+    param($Cfg, [switch]$Hash, [bool]$HashBound)
+
+    $mode = 'size'
+    $raw = Get-Prop $Cfg 'verify'
+    if ($null -ne $raw -and "$raw".Trim()) {
+        $mode = "$raw".Trim().ToLowerInvariant()
+        if ($mode -notin @('size', 'hash')) {
+            throw ("config.json: verify is '{0}'. Valid values are 'size' and 'hash'." -f $raw)
+        }
+    }
+    if ($HashBound) { return [bool]$Hash }
+    return ($mode -eq 'hash')
+}
+$Hash = Resolve-VerifyMode -Cfg $cfg -Hash:$Hash -HashBound $PSBoundParameters.ContainsKey('Hash')
+
 # How much free space a sink should keep once it is "full". Either an absolute
 # targetFreeGB or a percentage of the drive, whichever the config specifies.
 # $DriveCfg, not $Cfg: PowerShell variable names are case-insensitive, so a
@@ -123,10 +153,16 @@ function Get-Prop {
 # "fall back to the global setting" line into a read of this same object.
 function Get-SinkTargetFree {
     param($DriveCfg, $Stat)
+    # Tested against $null, not against truthiness. "if ($abs)" is false for 0, so
+    # a target of exactly 0 - which is what H: and J: now use, to fill to the
+    # brim - fell through both branches and reached "return 0" by accident rather
+    # than by intent. The answer was right; nothing documented that 0 was a real
+    # setting, so the next edit to this function could have turned "fill to full"
+    # into "fall back to a default" without any test noticing.
     $abs = Get-Prop $DriveCfg 'targetFreeGB'
-    if ($abs) { return [double]$abs * $GB }
+    if ($null -ne $abs) { return [double]$abs * $GB }
     $pct = Get-Prop $DriveCfg 'targetFreePct'
-    if ($pct) { return $Stat.Total * [double]$pct / 100 }
+    if ($null -ne $pct) { return $Stat.Total * [double]$pct / 100 }
     return 0
 }
 
@@ -188,6 +224,181 @@ function Get-FailingDisks {
 # Drive letter to physical disk number, cached because the scan loop asks for the
 # same handful of letters once per library root.
 $script:diskOfDrive = @{}
+
+# Which drives must not be read this run, and why.
+#
+# The event log names a disk by its *number*, and nothing else. Event 154 says
+# "Disco 3 (nome PDO: \Device\00000059)" and event 51 says "\Device\Harddisk3\DR3";
+# neither carries a serial number, and the EventData is unnamed driver data. Disk
+# numbers are not stable - Windows reassigns them across reboots and USB
+# reconnects - so an error logged against "disk 3" in September is not necessarily
+# the drive that is disk 3 now.
+#
+# That is not theoretical. It held H: out of a run on 2026-10-06 because the drive
+# that had failed in September was K:, K: has since become disk 4, and H: is disk 3
+# now. Every log line said "disk 3 has logged hardware errors" and named H:, and
+# every manual move to H: had worked perfectly throughout.
+#
+# There is no way to fix this retroactively: the events do not carry enough
+# identity to tell two disks apart. So this records the mapping as it observes it.
+# Every run writes down which UniqueId currently holds each disk number, and an
+# event naming a number whose owner has since changed is attributed to the UniqueId
+# that held the number *then* - and then to whichever drive letter that UniqueId has
+# now. Errors logged before this started are attributed to the current owner, which
+# is the old wrong answer, so the first runs after enabling it say so out loud
+# rather than quietly blaming a drive that never failed.
+function Get-DiskIdentity {
+    $out = @{}
+    try {
+        foreach ($d in @(Get-Disk -ErrorAction SilentlyContinue)) {
+            $uid = [string]$d.UniqueId
+            if (-not $uid) { continue }
+            $letters = @()
+            try {
+                $letters = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -and $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter):" })
+            }
+            catch { }
+            $out[$uid] = [pscustomobject]@{ UniqueId = $uid; Number = $d.Number; Letters = $letters }
+        }
+    }
+    catch { }
+    return $out
+}
+
+# diskNumber -> UniqueId, as observed on previous runs while errors were inside the
+# window. Without this the gate cannot tell a number that changed hands from a
+# genuinely failing drive.
+#
+# Always returns a hashtable. ConvertFrom-Json hands back a PSCustomObject, and a
+# caller that got one on the happy path and a hashtable on the missing-file path
+# would fail on exactly the run where it matters most - the first run, before
+# anything has been recorded.
+function Read-DiskNumberMap {
+    param([string]$Path)
+    $map = @{}
+    if (-not $Path) { return $map }
+    if (-not (Test-Path -LiteralPath $Path)) { return $map }
+    try {
+        $parsed = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        foreach ($p in $parsed.PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
+    }
+    catch { return @{} }
+    return $map
+}
+
+function Write-DiskNumberMap {
+    param([string]$Path, $Map)
+    if (-not $Path) { return }
+    try {
+        [System.IO.File]::WriteAllText($Path, ($Map | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    }
+    catch { }
+}
+
+# Turns the disk numbers the event log reports into the drive letters they really
+# belong to. Returns a hashtable of letter -> explanation, empty when nothing is
+# failing, so the caller can both skip the drive and say why.
+#
+# $Numbers and $Identity exist so the decision can be tested against a disk layout
+# the machine does not have. Pass -NoWrite to keep a test off the real map file.
+function Resolve-FailingDrives {
+    param(
+        [int]$WindowHours = 24,
+        [string]$MapPath,
+        $Numbers,
+        $Identity,
+        [switch]$NoWrite
+    )
+
+    # Wrapped in @() because the if-assignment yields $null when a branch produces
+    # nothing: Get-FailingDisks returns no objects when the event log is clean, and
+    # $null.Count throws under Set-StrictMode. The tests pass empty arrays explicitly
+    # to -Numbers, which is why this only surfaced on a live run with nothing wrong.
+    $numbers = @(if ($null -ne $Numbers) { $Numbers } else { Get-FailingDisks -WindowHours $WindowHours })
+    if ($numbers.Count -eq 0) {
+        # Nothing is failing, so nothing may stay recorded. Returning early without
+        # clearing would leave last window's ids on disk, and the next genuine
+        # failure on that number would be attributed to a disk from a run ago.
+        if (-not $NoWrite) { Write-DiskNumberMap -Path $MapPath -Map @{} }
+        return @{}
+    }
+
+    $byUnique = if ($null -ne $Identity) { $Identity } else { Get-DiskIdentity }
+    $byNumber = @{}
+    foreach ($uid in $byUnique.Keys) { $byNumber[[string]$byUnique[$uid].Number] = $uid }
+
+    $recorded = Read-DiskNumberMap -Path $MapPath
+    $next = @{}      # only the numbers failing now - see the note at the write
+    $out = @{}
+    $unverified = @()   # numbers seen failing for the first time - attribution is a guess
+    $stable = @()       # numbers whose owner has not changed - attribution is certain
+
+    foreach ($n in $numbers) {
+        $key = [string]$n
+        $nowUid = $byNumber[$key]
+        $wasUid = if ($recorded.ContainsKey($key)) { [string]$recorded[$key] } else { $null }
+
+        if (-not $wasUid) {
+            # First sighting of this number failing. Record who holds it, and let
+            # the fallback below attribute this run on the old, possibly wrong
+            # basis. From the next run on the answer is a real one.
+            if ($nowUid) { $next[$key] = $nowUid }
+            $unverified += $key
+            continue
+        }
+
+        if ($nowUid -and ($wasUid -eq $nowUid)) {
+            # The same physical disk holds the number now and then. It is still
+            # failing, so it is still held out - just without the reassignment
+            # note, because nothing about it moved.
+            $next[$key] = $wasUid
+            $stable += $key
+            continue
+        }
+
+        # The number changed hands. The errors belong to whoever held it then, and
+        # that disk is still present under some letter - so this is a real answer.
+        $owner = $byUnique[$wasUid]
+        if ($null -eq $owner) { continue }   # it has been removed since; nobody to hold out
+        $next[$key] = $wasUid
+        foreach ($letter in $owner.Letters) {
+            if ($out.ContainsKey($letter)) { continue }
+            $out[$letter] = ("disk {0} was a different physical disk when the errors were logged - it is {1} now" -f $key, $letter)
+        }
+    }
+
+    # Same disk before and after, so there is nothing to re-resolve - but it is
+    # still a failing disk and still gets held out. Reported after the reassigned
+    # numbers so a letter both point at keeps the reassignment explanation, which
+    # is the one that matters.
+    foreach ($n in $stable) {
+        $nowUid = $byNumber[[string]$n]
+        if (-not $nowUid) { continue }
+        foreach ($letter in $byUnique[$nowUid].Letters) {
+            if ($out.ContainsKey($letter)) { continue }
+            $out[$letter] = ("disk {0} has logged hardware or paging errors in the last {1}h" -f $n, $WindowHours)
+        }
+    }
+
+    # Nothing recorded for these numbers yet, so they are attributed to whoever
+    # holds them now. That is the old behaviour and may be wrong; it is reported
+    # rather than hidden, and the next run knows better.
+    foreach ($n in $unverified) {
+        $nowUid = $byNumber[[string]$n]
+        if (-not $nowUid) { continue }
+        foreach ($letter in $byUnique[$nowUid].Letters) {
+            if ($out.ContainsKey($letter)) { continue }
+            $out[$letter] = ("disk {0} has logged hardware or paging errors in the last {1}h" -f $n, $WindowHours)
+        }
+    }
+
+    # The map is rebuilt from the numbers failing right now, never merged. An entry
+    # that outlived the window would go stale, and the next time that number failed
+    # for real it would blame a disk that has had nothing to do with it.
+    if (-not $NoWrite) { Write-DiskNumberMap -Path $MapPath -Map $next }
+    return $out
+}
 function Get-DriveDiskNumber {
     param([string]$Letter)
     $key = $Letter.TrimEnd(':').ToUpperInvariant()
@@ -205,6 +416,290 @@ function Get-DriveDiskNumber {
     return $num
 }
 
+# Is this file still being written by qBittorrent?
+#
+# The previous rule was purely time-based: anything modified in the last 24 hours
+# was left alone. That is a blunt instrument - it holds back a 700GB season
+# because a file inside it was touched this morning - and it protects against
+# every writer on the machine while knowing nothing about any of them.
+#
+# This asks the thing that is actually downloading. A file is held only while a
+# torrent that is not finished still claims it, so media you have finished
+# watching becomes movable immediately instead of a day later.
+#
+# Three things that are easy to get wrong here, and are therefore pinned by
+# tests\download-guard.ps1:
+#
+#   * qBittorrent replies "application/json" with NO charset. PowerShell then
+#     guesses Latin-1 and an accented library root arrives as mojibake,
+#     which matches nothing. Every path comparison silently fails and the guard
+#     never fires. The bytes are decoded as UTF-8 explicitly below.
+#   * A prefix has to be matched on a separator boundary. "C:\Users\patri\Downloads"
+#     must not cover "C:\Users\patri\Downloads-old\x.mkv".
+#   * A file is held while qBittorrent still lists the torrent that owns it,
+#     whether or not that torrent is finished. qBittorrent keeps seeded torrents in
+#     its list indefinitely, so this is stricter than "is it downloading" and it
+#     does mean a library root stays held until the torrent is removed from the
+#     client. That is deliberate: removing the torrent is the signal that the file
+#     is yours to move, and it can only ever delay a move, never cause a bad one.
+#
+# If qBittorrent is not running it can be started for the check and closed again
+# afterwards, so a client the user keeps shut by hand does not become a prerequisite
+# for balancing. If it cannot be reached even then, the guard reports Unknown and
+# the caller falls back to the old time-based rule. Failing open here would let the
+# balancer move a half-written file, which is the one outcome worse than moving late.
+$script:DownloadGuard = $null
+
+function Get-DownloadGuard {
+    if ($null -ne $script:DownloadGuard) { return $script:DownloadGuard }
+
+    $settings = Get-Prop $cfg 'downloadGuard'
+    $guard = [pscustomobject]@{ Known = $false; Files = @(); Folders = @(); Unreadable = 0; Reason = 'not configured' }
+    $script:DownloadGuard = $guard
+
+    if (-not (Get-Prop $settings 'enabled')) { return $guard }
+    $url = [string](Get-Prop $settings 'url')
+    if (-not $url) { $guard.Reason = 'no url configured'; return $guard }
+    if ($url -notmatch '/api/v2/') { $url = $url.TrimEnd('/') + '/api/v2' }
+    $timeout = [int](Get-Prop $settings 'timeoutSeconds' 10)
+    if ($timeout -lt 1) { $timeout = 10 }
+
+    $blockSeeded = [bool](Get-Prop $settings 'blockSeeded' $true)
+    $startIfStopped = [bool](Get-Prop $settings 'startIfStopped' $false)
+    $stopAfterCheck = [bool](Get-Prop $settings 'stopAfterCheck' $true)
+    $exe = [string](Get-Prop $settings 'exePath')
+    $startTimeout = [int](Get-Prop $settings 'startTimeoutSeconds' 90)
+    if ($startTimeout -lt 5) { $startTimeout = 90 }
+
+    # How long after a boot to keep waiting for a client Windows is launching.
+    # qBittorrent is registered in the Run key, so it starts with Windows; its tray
+    # icon appears before the WebUI binds port 8080, and on a machine that is still
+    # settling that gap is tens of seconds. Asking "is a qbittorrent process
+    # running?" too early answers no, and the guard then starts a second copy that
+    # races the first for the port - and closes the lot on the way out.
+    $bootGrace = [int](Get-Prop $settings 'bootGraceSeconds' 300)
+    if ($bootGrace -lt 0) { $bootGrace = 300 }
+
+    $torrents = $null
+    # The pid of an instance this guard started itself, and nothing else. Ownership
+    # is a fact about a process, not about a guess: closing is driven by this pid
+    # alone, so a client the user or Windows started can never be shut down here.
+    $ourPid = $null
+    try {
+        try { $torrents = Read-QbtTorrents -Url $url -TimeoutSec $timeout } catch { $torrents = $null }
+
+        if ($null -eq $torrents -and $startIfStopped) {
+            # On a freshly booted machine, wait Windows out before concluding that
+            # nothing is running. Only time actually spent since boot counts, so a
+            # machine up for an hour does not sit here for another five minutes.
+            $waited = 0
+            if ($bootGrace -gt 0) {
+                try {
+                    $uptime = ((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalSeconds
+                    if ($uptime -lt $bootGrace) {
+                        $remaining = [int]($bootGrace - $uptime)
+                        $guard.Reason = "qBittorrent not answering yet; Windows started it {0:N0}s ago, waiting up to {1}s for it to bind" -f $uptime, $remaining
+                        $waited = $remaining
+                    }
+                }
+                catch { $waited = 0 }
+            }
+
+            $deadline = (Get-Date).AddSeconds($waited)
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 700
+                # Give up the moment a client answers, or a moment a process appears:
+                # if one is there, it is the user's or Windows', and waiting for its
+                # API is the next step rather than starting a second copy.
+                try { $torrents = Read-QbtTorrents -Url $url -TimeoutSec $timeout; break } catch { }
+                if (Get-Process qbittorrent -ErrorAction SilentlyContinue) {
+                    try { $torrents = Read-QbtTorrents -Url $url -TimeoutSec $timeout } catch { $torrents = $null }
+                    if ($null -ne $torrents) { break }
+                    # A process exists but the API is not up yet. Wait for it, but on
+                    # the shorter existing budget: this instance is already running.
+                    $until = (Get-Date).AddSeconds($startTimeout)
+                    while ((Get-Date) -lt $until) {
+                        Start-Sleep -Milliseconds 700
+                        try { $torrents = Read-QbtTorrents -Url $url -TimeoutSec $timeout; break } catch { }
+                    }
+                    break
+                }
+            }
+
+            if ($null -eq $torrents -and -not (Get-Process qbittorrent -ErrorAction SilentlyContinue)) {
+                # Genuinely nothing running after the boot grace period. Start one,
+                # keep its pid, and close exactly that pid afterwards.
+                if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
+                    $guard.Reason = "qBittorrent is not running and exePath '{0}' does not exist" -f $exe
+                    return $guard
+                }
+                $started = Start-Process -FilePath $exe -PassThru
+                $ourPid = $started.Id
+            }
+
+            if ($null -eq $torrents) {
+                $until = (Get-Date).AddSeconds($startTimeout)
+                while ((Get-Date) -lt $until) {
+                    Start-Sleep -Milliseconds 700
+                    try { $torrents = Read-QbtTorrents -Url $url -TimeoutSec $timeout; break } catch { }
+                }
+            }
+            if ($null -eq $torrents) {
+                $who = if ($null -ne $ourPid) { 'started qBittorrent' } else { 'qBittorrent is running' }
+                $guard.Reason = "{0} but its API did not answer within {1}s" -f $who, $startTimeout
+                return $guard
+            }
+        }
+
+        if ($null -eq $torrents) {
+            $guard.Reason = "qBittorrent not reachable at {0} and startIfStopped is off" -f $url
+            return $guard
+        }
+
+        foreach ($t in $torrents) {
+            # blockSeeded defaults to true: a file is held while qBittorrent still
+            # lists the torrent it belongs to, finished or not. That is stricter than
+            # "is it still downloading", and it is the safe direction - qBittorrent
+            # drops a torrent from its list the moment the user removes it, so
+            # holding until then can only ever delay a move, never cause one.
+            $done = $false
+            try { $done = ([double]$t.progress -ge 1) } catch { $done = $false }
+            if ($done -and -not $blockSeeded) { continue }
+
+            # Exact files, not the containing folder. A torrent's save_path is
+            # whatever the user chose when they added it, and it is very often a
+            # whole library folder rather than the release inside it. Blocking on
+            # save_path alone held 48 files when only 6 torrents existed, and every
+            # file under Downloads\Filmes and Downloads\S<accent>ries with it - including
+            # finished movies belonging to no torrent at all. The per-torrent file
+            # list is the only answer precise enough to be useful here.
+            $savePath = [string]$t.PSObject.Properties['save_path'].Value
+            $hash = [string]$t.PSObject.Properties['hash'].Value
+            $files = $null
+            if ($hash) {
+                try { $files = Read-QbtFiles -Url $url -Hash $hash -TimeoutSec $timeout } catch { $files = $null }
+            }
+            if ($null -eq $files) {
+                # Could not be read. Fall back to the folder rather than to nothing,
+                # because this is the one place where guessing open would let a
+                # half-written file be moved. Coarse, but in the safe direction.
+                if ($savePath) { $guard.Folders += $savePath.TrimEnd('\') }
+                $guard.Unreadable++
+                continue
+            }
+            foreach ($f in $files) {
+                $rel = [string]$f.PSObject.Properties['name'].Value
+                if (-not $rel) { continue }
+                if ($savePath) { $guard.Files += (Join-Path $savePath $rel) }
+                elseif ($f.PSObject.Properties['absolute_path']) {
+                    $guard.Files += [string]$f.PSObject.Properties['absolute_path'].Value
+                }
+            }
+        }
+        $guard.Files = @($guard.Files | Sort-Object -Unique)
+        $guard.Folders = @($guard.Folders | Sort-Object -Unique)
+        $guard.Known = $true
+        $guard.Reason = ("{0} torrent(s) listed, {1} file(s) held, {2} folder(s) held loosely{3}" -f
+            @($torrents).Count, $guard.Files.Count, $guard.Folders.Count,
+            $(if ($guard.Unreadable) { ", {0} torrent(s) could not be listed" -f $guard.Unreadable } else { '' }))
+    }
+    finally {
+        # Closed in a finally, so a failure above cannot leave behind a torrent
+        # client that was only ever started to answer one question.
+        #
+        # Two conditions, both required. $ourPid is set only on the line that
+        # actually launched an instance from this guard, so it is never set by a
+        # race with Windows launching one. And the process list must still contain
+        # exactly that pid: /api/v2/app/shutdown shuts down whatever owns port 8080,
+        # so if a second instance appeared meanwhile - Windows' own, started late -
+        # the call would kill the user's client instead of ours. When that is even
+        # possible the client is left alone and the reason says so.
+        #
+        # This is not hypothetical. On 2026-10-07 the old flag-based close fired a
+        # second after qBittorrent's WebUI bound, killing a client Windows had
+        # started at logon, purely because the process check had not yet seen it.
+        if ($null -ne $ourPid -and $stopAfterCheck) {
+            $live = @(Get-Process qbittorrent -ErrorAction SilentlyContinue)
+            if ($live.Count -eq 1 -and $live[0].Id -eq $ourPid) {
+                try {
+                    # qBittorrent's own endpoint, not Stop-Process: it saves the session
+                    # and rewrites its .torrent files on the way out, and a kill loses
+                    # that. Verified to work; there is no window to close instead, because
+                    # the tray icon means MainWindowHandle is 0.
+                    Invoke-WebRequest -Uri "$url/app/shutdown" -Method Post -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop | Out-Null
+                    $until = (Get-Date).AddSeconds(30)
+                    while ((Get-Date) -lt $until -and (Get-Process -Id $ourPid -ErrorAction SilentlyContinue)) {
+                        Start-Sleep -Milliseconds 400
+                    }
+                }
+                catch { Write-Warning "could not close qBittorrent after checking it: $($_.Exception.Message)" }
+            }
+            elseif ($live.Count -eq 0) {
+                # It exited on its own between the check and here. Nothing to close.
+            }
+            else {
+                $guard.Reason = ($guard.Reason + " | left qBittorrent running: it is not the instance this guard started").Trim()
+            }
+        }
+    }
+    return $guard
+}
+
+# The torrent list, or throws. Split out so the "try, else start it" dance above has
+# one thing to retry.
+function Read-QbtTorrents {
+    param([string]$Url, [int]$TimeoutSec)
+
+    $resp = Invoke-WebRequest -Uri "$Url/torrents/info" -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+    # Decoded by hand on purpose - see the note above Get-DownloadGuard.
+    $json = [System.Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())
+    # NOT wrapped in @(). PowerShell 5.1's ConvertFrom-Json returns a top-level JSON
+    # array as a single Object[], and @() around it produces a one-element array whose
+    # only element is that array. foreach then walks once, over the whole list, and
+    # every property read below returns null - so the guard collects no paths and
+    # silently never blocks anything. It looks like it is working the entire time.
+    $list = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+    # Comma-wrapped, deliberately. "[]" parses to an EMPTY ARRAY, and return of an
+    # empty array from a function assigns $null to the caller - which the guard then
+    # reads as "the client did not answer". So a machine with no torrents at all would
+    # quietly fall back to the time-based rule instead of holding nothing, which is
+    # the opposite of what an empty list means.
+    return , $list
+}
+
+# Every file one torrent owns, or throws. This is the precise answer; save_path is
+# whatever folder the user happened to pick when adding the torrent, which is often
+# a whole library rather than the release inside it.
+function Read-QbtFiles {
+    param([string]$Url, [string]$Hash, [int]$TimeoutSec)
+
+    $resp = Invoke-WebRequest -Uri "$Url/torrents/files?hash=$Hash" -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+    $json = [System.Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())
+    return , (ConvertFrom-Json -InputObject $json -ErrorAction Stop)
+}
+
+# $true when the path is a file a listed torrent owns, $false when it is safe to
+# move. Exact file paths are compared first; the folder list is only a fallback for
+# torrents whose file list could not be read.
+function Test-Downloading {
+    param([string]$Path)
+
+    $guard = Get-DownloadGuard
+    if (-not $guard.Known) { return $false }
+    $probe = $Path.TrimEnd('\')
+
+    foreach ($f in $guard.Files) {
+        if ($probe.Equals($f, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    if (-not $guard.Folders.Count) { return $false }
+    foreach ($prefix in $guard.Folders) {
+        if ($probe.Length -le $prefix.Length) { continue }
+        if (-not $probe.StartsWith($prefix + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        return $true
+    }
+    return $false
+}
+
 # A "unit" is one movable thing: a single movie file, or a single episode.
 # Episodes move individually rather than as whole show folders, so a show can
 # spread across drives when only part of it fits. The show folder is recreated
@@ -216,10 +711,19 @@ function Get-Units {
     if (-not (Test-Path -LiteralPath $Root)) { return $units }
     $exts = @($Library.mediaExtensions | ForEach-Object { $_.ToLowerInvariant() })
 
+    # Asked once, here, so the reason for skipping is decided once per root rather
+    # than per file. The cutoff is the fallback, not the rule: it only applies while
+    # the download guard cannot answer, because "qBittorrent is not running" must
+    # not turn into "that half-downloaded file is fine to move".
+    $guard = Get-DownloadGuard
+    $useTimeFallback = -not $guard.Known
+
     if ($Library.unit -eq 'file') {
         foreach ($f in Get-ChildItem -LiteralPath $Root -File -Force -ErrorAction SilentlyContinue) {
             if ($exts -notcontains $f.Extension.ToLowerInvariant()) { continue }
-            $skip = if ($f.LastWriteTime -gt $Cutoff) { 'modified recently' } else { $null }
+            $skip = if (Test-Downloading $f.FullName) { 'still downloading' }
+            elseif ($useTimeFallback -and $f.LastWriteTime -gt $Cutoff) { 'modified recently' }
+            else { $null }
             $units += [pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Kind = 'file'
                 SubPath = $f.Name; Show = ''
                 Size = $f.Length; Files = @($f.FullName); Newest = $f.LastWriteTime; Skip = $skip }
@@ -230,7 +734,9 @@ function Get-Units {
             $files = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Force -ErrorAction SilentlyContinue)
             foreach ($f in $files) {
                 if ($exts -notcontains $f.Extension.ToLowerInvariant()) { continue }
-                $skip = if ($f.LastWriteTime -gt $Cutoff) { 'modified recently' } else { $null }
+                $skip = if (Test-Downloading $f.FullName) { 'still downloading' }
+                elseif ($useTimeFallback -and $f.LastWriteTime -gt $Cutoff) { 'modified recently' }
+                else { $null }
                 # keep the show/season layout relative to the library root
                 $rel = $f.FullName.Substring($Root.Length).TrimStart('\')
                 $units += [pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Kind = 'episode'
@@ -514,16 +1020,32 @@ function Invoke-RecycleBinReclaim {
 
         $targets = @()
         $unreadable = 0
+        $orphan = 0
 
         foreach ($letter in $letters) {
             $binRoot = '{0}\$Recycle.Bin' -f $letter
             if (-not (Test-Path -LiteralPath $binRoot)) { continue }
 
-            # One level down only. The payload of a deleted folder is an entire
-            # directory tree, and descending into one on a disk that is starting
-            # to fail is the hang this pass used to be able to cause.
-            foreach ($sid in @(Get-ChildItem -LiteralPath $binRoot -Directory -Force -ErrorAction SilentlyContinue)) {
-                $metas = @(Get-ChildItem -LiteralPath $sid.FullName -File -Filter '$I*' -Force -ErrorAction SilentlyContinue)
+            # Two layouts, and this pass has to handle both.
+            #
+            # A fixed volume keeps one folder per account, so the $I records sit one
+            # level down inside a SID folder. A removable or exFAT volume has no such
+            # folder: the records sit directly in $Recycle.Bin. That is H: and every
+            # USB stick. Looking only inside subfolders found nothing there and
+            # reported "no library media waiting to be destroyed" without a word -
+            # which is the worst failure this pass can have, a bin nobody empties
+            # because the tool said it was already empty.
+            #
+            # Only these two levels are ever listed. Nothing recurses into a payload
+            # tree, which is the hang this pass used to be able to cause on a disk
+            # that was starting to fail.
+            $bins = @($binRoot)
+            foreach ($sub in @(Get-ChildItem -LiteralPath $binRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+                $bins += $sub.FullName
+            }
+
+            foreach ($dir in $bins) {
+                $metas = @(Get-ChildItem -LiteralPath $dir -File -Filter '$I*' -Force -ErrorAction SilentlyContinue)
                 foreach ($meta in $metas) {
                     $info = Read-RecycleMeta -Path $meta.FullName
                     if ($null -eq $info) { $unreadable++; continue }
@@ -533,8 +1055,13 @@ function Invoke-RecycleBinReclaim {
                     # its metadata record, same suffix on both sides. Clearing
                     # only the payload leaves Explorer listing an entry with
                     # nothing behind it.
-                    $payload = Join-Path -Path $sid.FullName -ChildPath ('$R' + $meta.Name.Substring(2))
-                    if (-not (Test-Path -LiteralPath $payload)) { continue }
+                    $payload = Join-Path -Path $dir -ChildPath ('$R' + $meta.Name.Substring(2))
+                    # The metadata outlived its payload - the file went, the record
+                    # did not. Counted rather than dropped: there is nothing to free,
+                    # but a stale record is what makes an entry linger in Explorer,
+                    # and silently ignoring it hides that from the person who has to
+                    # clear it by hand.
+                    if (-not (Test-Path -LiteralPath $payload)) { $orphan++; continue }
 
                     $bytes = [int64]$info.Size
                     $isFolder = $false
@@ -570,6 +1097,9 @@ function Invoke-RecycleBinReclaim {
             }
         }
 
+        if ($orphan) {
+            Write-Host ('  {0} entry/entries have a metadata record but no payload left - nothing to free, clear them by hand in Explorer' -f $orphan) -ForegroundColor Yellow
+        }
         if ($unreadable) {
             Write-Host ('  left {0} item(s) alone: the $I record could not be read, so their origin is unknown' -f $unreadable) -ForegroundColor Yellow
         }
@@ -695,9 +1225,15 @@ function Invoke-RecycleBinReclaim {
 # been walked.
 $errorWindow = Get-Prop $cfg 'driveErrorWindowHours'
 if ($null -eq $errorWindow) { $errorWindow = 24 }
-$failingDisks = @(Get-FailingDisks -WindowHours ([int]$errorWindow))
-if ($failingDisks.Count) {
-    Write-Warning ("Windows logged hardware or paging errors on disk {0} in the last {1}h. Those drives will not be read this run." -f ($failingDisks -join ', '), $errorWindow)
+$diskMapPath = Join-Path $logDir 'diskmap.json'
+$unreadableDriveReason = Resolve-FailingDrives -WindowHours ([int]$errorWindow) -MapPath $diskMapPath
+if ($unreadableDriveReason.Count) {
+    # Named by drive letter and not by disk number, because the number is what
+    # makes the old message wrong: it named the letter holding that number now,
+    # which is how a failing K: was reported as a failing H:.
+    foreach ($letter in ($unreadableDriveReason.Keys | Sort-Object)) {
+        Write-Warning ("not reading {0} - {1}. Treat it as failed until it is replaced or the errors stop." -f $letter, $unreadableDriveReason[$letter])
+    }
 }
 
 # Reclaim runs first, so bytes freed here are visible to the planning phase in
@@ -715,6 +1251,9 @@ else {
     Write-Host 'recycle bin reclaim is off (set recycleReclaim: true in config.json to enable)' -ForegroundColor DarkGray
 }
 
+# Fallback only. The download guard is the real rule - see Get-DownloadGuard.
+# This still applies whenever qBittorrent cannot be reached, so a client that is
+# closed or restarting does not silently release half-written files.
 $cutoff = (Get-Date).AddHours(-[double]$cfg.skipFilesModifiedWithinHours)
 $stats = @{}
 foreach ($letter in $cfg.drives.PSObject.Properties.Name) {
@@ -829,24 +1368,26 @@ foreach ($letter in ($stats.Keys | Sort-Object)) {
     }
 }
 
-# The last drive in the chain is a parking lot: content that lands there is
-# effectively stranded, because nothing downstream can move it again. Mark it on
-# both lists so the rules below can recognise it by role rather than by hardcoding
-# a letter. A chain with no priorities at all leaves IsLast false everywhere and
-# every drive stays unrestricted.
+# The last drive in the chain can no longer pass content onward, because nothing
+# runs after it. Mark it on both lists so Test-Shed can recognise it by role
+# rather than by hardcoding a letter. A chain with no priorities at all leaves
+# IsLast false everywhere and every drive stays unrestricted.
 #
-# The parking lot is a DECLARED role, so it is resolved from the configured
-# priorities of every drive in config.json - not from whichever drives happen to
-# be sources or sinks on a given run.
+# IsLast is resolved from the configured priorities of every drive in config.json -
+# not from whichever drives happen to be sources or sinks on a given run.
 #
-# That distinction is the whole bug. Deriving the chain end from the live lists
-# let the hat slide: when F: (priority 5) was neither a source nor had headroom
-# to be a sink, the highest priority present collapsed to G: (4), G: was marked
-# IsLast, and Test-Forward then correctly applied the parking-lot give-back rule
-# to move G: content BACKWARDS to D: (3). Observed live on 2026-10-04:
-# "G -> D:\Séries\..." on four files in one apply run, and planned on every run
-# since 2026-10-03 16:05. A drive must never inherit the role because a different
-# drive is absent, unplugged, or full - only because config says it is last.
+# That distinction was a real bug once. Deriving the chain end from the live lists
+# let the hat slide: when F: (priority 5) was neither a source nor had headroom to
+# be a sink, the highest priority present collapsed to G: (4), G: was marked IsLast,
+# and Test-Forward then applied the give-back rule to move G: content BACKWARDS to
+# D: (3). Observed live on 2026-10-04 on four files, and planned on every run since
+# 2026-10-03. A drive must never inherit the role because a different drive is
+# absent, unplugged, or full - only because config says it is last.
+#
+# IsLast no longer grants any backwards move. Backwards movement was removed
+# outright (see Test-Forward), so its only remaining job is the demand gate in
+# Test-Shed: the end of the chain accepts from its neighbour only when that
+# neighbour has something genuinely waiting for the room.
 $chainMax = 0
 $chainMaxFound = $false
 foreach ($dp in $cfg.drives.PSObject.Properties) {
@@ -860,14 +1401,26 @@ foreach ($x in @($sources) + @($sinks)) {
 }
 
 # True when $To is downstream of $From and may therefore receive from it.
-# The cascade runs one way: C: -> K: -> D: -> G: -> F:. Content taken off a drive
-# lands further along the chain, never back on an earlier one, otherwise a drive
-# can be drained and refilled in the same run and the ordering means nothing.
-# Picking purely by tightness ignored this and moved G: content onto D:.
 #
-# One step back is allowed, but only from the parking lot. F: is last, so its
-# content has nowhere left to go; handing it back to G: keeps that space in
-# circulation instead of freezing it on a drive that will never release it.
+# The chain is strictly one way, with no exceptions:
+#
+#     C: -> D: F: G: H: J: K:
+#     K: -> D: F: G: H: J:
+#     D: -> F: G: H: J:
+#     F: -> G: H: J:
+#     G: -> H: J:
+#     H: -> J:
+#     J: -> nowhere
+#
+# Every destination has a HIGHER priority number than its source, or sits outside
+# the chain entirely. Nothing ever moves backwards, and that includes the last
+# drive: G: used to be permitted one step back to F: as a "give-back", on the
+# reasoning that a full parking lot should return space rather than freeze it. It
+# did the opposite of that in practice - F: and G: traded the same three files back
+# and forth across runs, each copy paid for in full and undone an hour later, and
+# on 2026-10-06 it left three files stranded on a full F: that could reach neither
+# G: (blocked) nor H:/J: (full). The chain ends at J: because J: is the end of the
+# road, not because the drive before it needs to hand content back.
 #
 # A drive that declares no priority (H:, J:) is not a link in the chain, so it
 # stays reachable from anywhere; likewise a source with no priority, which has no
@@ -876,84 +1429,25 @@ function Test-Forward {
     param($From, $To)
     if (-not $From -or -not $From.InCascade) { return $true }
     if (-not $To.InCascade) { return $true }
-    if ($To.Priority -gt $From.Priority) { return $true }
-    return ($From.IsLast -and $To.Priority -eq ($From.Priority - 1))
+    return ($To.Priority -gt $From.Priority)
 }
 
-# Adds the reason the parking lot is special. F: accepts from the drive just
-# upstream only to make room for something waiting for that room - otherwise G:
-# would spend the run relocating its own library into a drive that gives nothing
-# back, which is churn with no gain. $Demand counts the units that were turned
-# away from each drive for lack of space earlier in this run.
+# Adds one rule on top of the direction check: the end of the chain only accepts
+# from the drive just upstream when something is genuinely waiting for that room.
+# Otherwise the last drive spends every run absorbing its neighbour's library for
+# no gain - it has nowhere to pass it on to, since the chain ends there.
+#
+# $Demand counts the units that were turned away from each drive for lack of space
+# earlier in this run.
 function Test-Shed {
-    param($From, $To, $Demand, $UnitKey)
+    param($From, $To, $Demand)
     if (-not (Test-Forward -From $From -To $To)) { return $false }
     if (-not $From -or -not $From.InCascade) { return $true }
     if (-not $To.InCascade) { return $true }
     if (-not $To.IsLast) { return $true }
-    # Content the parking lot handed back does not go straight back in. Without
-    # this the give-back is pointless: the unit sits one step upstream with room
-    # in front of it and is returned on the very next run.
-    if ($UnitKey -and $script:GivenBack.ContainsKey($UnitKey)) { return $false }
     $waiting = 0
     if ($Demand -and $Demand.ContainsKey($From.Letter)) { $waiting = [int]$Demand[$From.Letter] }
     return ($waiting -gt 0)
-}
-
-# --- parking-lot give-back ledger --------------------------------------------
-# The parking lot may hand content back one step so its space stays in
-# circulation. Nothing recorded that, so the next run saw the same content one
-# step upstream with room in front of it and sent it straight back: observed on
-# 2026-10-03 as F: -> G: -> F: on a single file, six times, an hour apart, every
-# copy paid for in full and undone an hour later.
-#
-# So a unit that has been given back is remembered here and the parking lot then
-# refuses it until the record ages out. The key is the library plus the path
-# relative to the library root, which survives the move because Invoke-Move
-# preserves that layout.
-#
-# Every failure path degrades to an empty ledger, which is exactly the previous
-# behaviour. A missing, corrupt or unwritable ledger must never be able to stop a
-# move - this is a convenience against churn, not a correctness mechanism.
-$script:GivenBack = @{}
-$script:GivenBackMaxAgeDays = 7
-
-function Read-GivenBackLedger {
-    param([string]$Path, [int]$MaxAgeDays)
-    $kept = @{}
-    try {
-        if (-not (Test-Path -LiteralPath $Path)) { return $kept }
-        $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
-        if (-not $raw) { return $kept }
-        $loaded = $raw | ConvertFrom-Json
-        if (-not $loaded) { return $kept }
-        # Timestamps are written as UTC round-trip ("o"), which sorts correctly
-        # as text - so ageing out needs no date parsing and no locale.
-        $cut = (Get-Date).ToUniversalTime().AddDays(-$MaxAgeDays).ToString('o')
-        foreach ($p in $loaded.PSObject.Properties) {
-            $v = [string]$p.Value
-            if ($v.Length -lt 20) { continue }
-            if ($v -ge $cut) { $kept[$p.Name] = $v }
-        }
-    }
-    catch { return @{} }
-    return $kept
-}
-
-function Save-GivenBackLedger {
-    param([string]$Path, $Ledger)
-    try {
-        $json = [ordered]@{}
-        foreach ($k in ($Ledger.Keys | Sort-Object)) { $json[$k] = $Ledger[$k] }
-        $tmp = "$Path.tmp"
-        [System.IO.File]::WriteAllText($tmp, ($json | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
-        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
-    }
-    catch {
-        # Losing the ledger only means the give-back loop can resume. Say so,
-        # because carrying on silently would hide the write failure.
-        Write-Host ("  note: could not update the give-back ledger ({0}) - churn protection is off for now" -f $_.Exception.Message) -ForegroundColor DarkYellow
-    }
 }
 
 Write-Host ''
@@ -980,8 +1474,9 @@ if (-not $sinks.Count) {
 $allUnits = @()
 $rootMap = @{}
 
-# $failingDisks was already resolved before the recycle bin pass, which needs it
-# too. $unreadableDrives is built here, per root, as the roots are walked.
+# Resolved before the planning phase, so the whole run agrees on which drives are
+# unreadable. $unreadableDrives collects the same letters here, per root, so a
+# drive that has no library root is still reported rather than silently skipped.
 $unreadableDrives = @{}
 
 foreach ($lib in $cfg.libraries) {
@@ -990,15 +1485,17 @@ foreach ($lib in $cfg.libraries) {
         $rootMap["$($lib.name)|$letter"] = $root
         if (-not $stats.ContainsKey($letter)) { continue }
 
-        # Refuse to enumerate a drive whose disk is logging I/O errors. Reading
-        # it is what hangs, and a skipped scan costs one run; a hung scan costs
-        # the machine.
-        $diskNo = Get-DriveDiskNumber -Letter $letter
-        if ($null -ne $diskNo -and $failingDisks -contains $diskNo) {
-            if (-not $unreadableDrives.ContainsKey($letter)) {
-                Write-Warning ("not reading {0} - disk {1} has logged hardware errors. Treat it as failed until it is replaced or the errors stop." -f $letter, $diskNo)
-                $unreadableDrives[$letter] = $diskNo
-            }
+        # Refuse to enumerate a drive whose disk is logging I/O errors. Reading it
+        # is what hangs, and a skipped scan costs one run; a hung scan costs the
+        # machine.
+        #
+        # The letter comes from Resolve-FailingDrives, which compared the recorded
+        # identity of each failing disk number against the identity it holds now.
+        # Get-DriveDiskNumber is deliberately not used here: it maps the letter to
+        # the number it has *now*, which is the wrong question and is what made a
+        # failing K: get reported as a failing H:.
+        if ($unreadableDriveReason.ContainsKey($letter)) {
+            $unreadableDrives[$letter] = $unreadableDriveReason[$letter]
             continue
         }
 
@@ -1052,25 +1549,12 @@ $pool = @($pool | Sort-Object @{e = { $rank[$_.Drive] } }, @{e = $sizeKey })
 # would just be shuffling into F: for nothing".
 $demand = @{}
 
-# The give-back ledger, read once per run. It names the units the parking lot has
-# already handed back, so the parking lot will not take them straight back in.
-$givenBackFile = Join-Path $logDir 'givenback.json'
-$script:GivenBack = Read-GivenBackLedger -Path $givenBackFile -MaxAgeDays $script:GivenBackMaxAgeDays
-$givenBackDirty = $false
-if ($script:GivenBack.Count) {
-    Write-Host ("  {0} unit(s) were given back by the parking lot; it will not take them again for {1} day(s)." -f $script:GivenBack.Count, $script:GivenBackMaxAgeDays) -ForegroundColor DarkGray
-}
-
 foreach ($u in $pool) {
     if (Test-UnitLocked -Unit $u) {
             Write-Host ("  skip (in use)   [{0}] {1}" -f $u.Drive, $u.Name) -ForegroundColor DarkGray
             Write-Log 'skip_in_use' @{ path = $u.Path; sizeGB = [math]::Round($u.Size / $GB, 2) }; $skipped++; continue
         }
         $from = $chain[$u.Drive]
-        # Library plus the path relative to the library root. Stable across
-        # drives, because Invoke-Move preserves that layout under the
-        # destination root - so the key still matches after the unit has moved.
-        $unitKey = '{0}|{1}' -f $u.Library, $u.SubPath
         $target = $null
         # Downstream candidates only, then tightest-first within that set so a
         # small drive like J: actually gets used instead of everything piling
@@ -1081,7 +1565,7 @@ foreach ($u in $pool) {
         # unit could be "moved" onto itself. And never a drive upstream in the
         # cascade, which is what used to send G: content to D:.
         $forward = @($sinks | Where-Object {
-            $_.Letter -ne $u.Drive -and (Test-Shed -From $from -To $_ -Demand $demand -UnitKey $unitKey)
+            $_.Letter -ne $u.Drive -and (Test-Shed -From $from -To $_ -Demand $demand)
         })
         foreach ($snk in ($forward | Sort-Object -Property Headroom)) {
             $snkMaxUnit = Get-Prop $snk.Cfg 'maxUnitGB'
@@ -1147,17 +1631,12 @@ foreach ($u in $pool) {
         Write-State -Phase 'moving' -Current $u.Name -Moved $moved -Planned $planned -Skipped $skipped
         if (Invoke-Move -Unit $u -DestRoot $target.Sink.Letter -DestPath $target.DestPath -DriveStat $target.Sink.Stat -DestCfg $target.Sink.Cfg) {
             $planned++; if ($Apply) { $moved++ }
-            # Note a give-back so the parking lot will not take this unit straight
-            # back in on the next run - that is the whole point of the give-back,
-            # and without the note it undoes itself an hour later. Only in apply
-            # mode: a dry run moves nothing, and recording there would refuse a
-            # move that never actually happened.
-            if ($Apply -and $from -and $from.IsLast -and $target.Sink.InCascade -and
-                $target.Sink.Priority -eq ($from.Priority - 1)) {
-                $script:GivenBack[$unitKey] = (Get-Date).ToUniversalTime().ToString('o')
-                $givenBackDirty = $true
-                Write-Host ("  noted in the give-back ledger - {0} will not be returned to {1} for {2} day(s)" -f $u.Name, $target.Sink.Letter, $script:GivenBackMaxAgeDays) -ForegroundColor DarkGray
-            }
+            # Nothing is recorded here any more. There used to be a give-back
+            # ledger, written on every move the parking lot made one step back up
+            # the chain so it would not take the same unit straight back in. With
+            # backwards moves removed there is no give-back to record, and a ledger
+            # nothing writes is worse than no ledger: it still gets read, still gets
+            # pruned, and still appears in the docs as a protection that is gone.
             # Re-read the live figure only when bytes actually moved: on a
             # nearly-full volume the reported number drifts and a live read is
             # the truth. A dry run writes nothing, so re-reading would hand back
@@ -1186,8 +1665,6 @@ foreach ($u in $pool) {
             }
         }
 }
-
-if ($givenBackDirty) { Save-GivenBackLedger -Path $givenBackFile -Ledger $script:GivenBack }
 
 Write-Host ''
 Write-Host ("planned: {0}   moved: {1}   skipped: {2}   log: {3}" -f $planned, $moved, $skipped, $logFile) -ForegroundColor Cyan

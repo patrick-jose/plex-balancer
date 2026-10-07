@@ -394,7 +394,90 @@ else {
     }
 }
 
-# ---- 6. how these rows reach the screen --------------------------------------
+# ---- 6. the flat layout used by removable and exFAT volumes ------------------
+# A fixed volume puts the $I records inside a per-account SID folder. A removable
+# or exFAT volume has no such folder and puts them directly in $Recycle.Bin - which
+# is H: and every USB stick.
+#
+# This section exists because the pass originally looked only inside subfolders, so
+# on those volumes it found nothing and reported "no library media waiting to be
+# destroyed" without a word. A bin nobody empties because the tool said it was
+# already empty is the worst failure this pass can have, and it was silent.
+$flatBase = Join-Path ([System.IO.Path]::GetTempPath()) ('recycle-flat-' + [guid]::NewGuid().ToString('N').Substring(0, 10))
+New-Item -ItemType Directory -Path $flatBase -Force | Out-Null
+& subst 'Q:' $flatBase
+try {
+    # no SID folder at all - this is the whole point
+    $flatBin = 'Q:\$Recycle.Bin'
+    New-Item -ItemType Directory -Path $flatBin -Force | Out-Null
+
+    # Windows also drops desktop.ini in there; it must not be mistaken for a record
+    [System.IO.File]::WriteAllText((Join-Path $flatBin 'desktop.ini'), '[.ShellClassInfo]')
+
+    function New-Flat {
+        param([string]$Suffix, [string]$Origin, [int]$Bytes = 2048, [switch]$NoPayload)
+        $m = [System.IO.MemoryStream]::new()
+        $m.Write([BitConverter]::GetBytes([int64]2), 0, 8)
+        $m.Write([BitConverter]::GetBytes([int64]$Bytes), 0, 8)
+        $m.Write([BitConverter]::GetBytes([int64]0), 0, 8)
+        $m.Write([BitConverter]::GetBytes([uint32]($Origin.Length + 1)), 0, 4)
+        $m.Write([System.Text.Encoding]::Unicode.GetBytes($Origin + [char]0), 0, ($Origin.Length + 1) * 2)
+        [System.IO.File]::WriteAllBytes((Join-Path $flatBin ('$I' + $Suffix)), $m.ToArray())
+        $m.Dispose()
+        if (-not $NoPayload) {
+            [System.IO.File]::WriteAllBytes((Join-Path $flatBin ('$R' + $Suffix)), (New-Object byte[] $Bytes))
+        }
+    }
+
+    New-Flat -Suffix 'FLAT.mkv' -Origin 'Q:\Series\Flat Layout Show S01E03.mkv'
+    New-Flat -Suffix 'ORPH.mkv' -Origin 'Q:\Series\No Payload.mkv' -NoPayload
+    New-Flat -Suffix 'PRIV.mkv' -Origin 'C:\Users\YOURNAME\Documents\holiday.mkv'
+    # a zero-length stub, which is what exFAT leaves behind after a partial empty
+    [System.IO.File]::WriteAllBytes((Join-Path $flatBin '$IZERO.mkv'), (New-Object byte[] 0))
+
+    $script:cfg = [pscustomobject]@{
+        libraries = @([pscustomobject]@{ name = 'TV'; roots = @("Q:\Series") })
+    }
+    $script:Logged = @(); $script:Warnings = @()
+    $script:Apply = $false
+    $script:failingDisks = @()
+    $flatOut = (& { Invoke-RecycleBinReclaim } 6>&1) -join "`n"
+
+    $flatEvents = @($script:Logged | Where-Object { $_.Event -eq 'recycle_would_destroy' })
+    Assert-Equal 'flat bin: the library item is found' $flatEvents.Count 1
+    Assert-True 'flat bin: and it is the right one' ($flatEvents.Data.name -contains 'Flat Layout Show S01E03.mkv')
+    Assert-True 'flat bin: drive is the removable volume' ($flatEvents.Data.drive -eq 'Q:')
+    Assert-False 'flat bin: personal file still left alone' ($flatEvents.Data.name -contains 'holiday.mkv')
+    Assert-True 'flat bin: the orphan is reported, not silently dropped' ($flatOut -match 'metadata record but no payload')
+    Assert-True 'flat bin: the zero-length stub is reported' ($flatOut -match 'could not be read')
+    Assert-False 'flat bin: desktop.ini is not treated as a record' ($flatOut -match 'desktop')
+
+    # and the SID layout still works, because the fix added a level rather than
+    # replacing one
+    New-Item -ItemType Directory -Path (Join-Path $flatBin 'S-1-5-21-1-2-3-1001') -Force | Out-Null
+    $sidDir = Join-Path $flatBin 'S-1-5-21-1-2-3-1001'
+    $m2 = [System.IO.MemoryStream]::new()
+    $o2 = 'Q:\Series\Sid Layout Show S02E01.mkv'
+    $m2.Write([BitConverter]::GetBytes([int64]2), 0, 8)
+    $m2.Write([BitConverter]::GetBytes([int64]2048), 0, 8)
+    $m2.Write([BitConverter]::GetBytes([int64]0), 0, 8)
+    $m2.Write([BitConverter]::GetBytes([uint32]($o2.Length + 1)), 0, 4)
+    $m2.Write([System.Text.Encoding]::Unicode.GetBytes($o2 + [char]0), 0, ($o2.Length + 1) * 2)
+    [System.IO.File]::WriteAllBytes((Join-Path $sidDir '$ISID.mkv'), $m2.ToArray())
+    $m2.Dispose()
+    [System.IO.File]::WriteAllBytes((Join-Path $sidDir '$RSID.mkv'), (New-Object byte[] 2048))
+
+    $script:Logged = @()
+    $null = (& { Invoke-RecycleBinReclaim } 6>&1)
+    $both = @($script:Logged | Where-Object { $_.Event -eq 'recycle_would_destroy' })
+    Assert-Equal 'both layouts: flat and SID are scanned in one run' $both.Count 2
+}
+finally {
+    & subst 'Q:' /d
+    Remove-Item -LiteralPath $flatBase -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---- 7. how these rows reach the screen --------------------------------------
 # status.ps1 decides the EVENT label and the ROUTE column itself, so the rows
 # only read correctly if the two agree on which field holds the drive. These are
 # lifted from status.ps1 rather than asserted about, because a rename there would
@@ -416,7 +499,7 @@ Assert-Equal 'route: pending item' (Get-Route ([pscustomobject]@{ event = 'recyc
 Assert-Equal 'route: verification row' (Get-Route ([pscustomobject]@{ event = 'recycle_verify'; drive = 'D:'; expectedGB = 14.98; freedGB = 0.4 })) 'D:'
 Assert-True 'route: verification row is not blank' ((Get-Route ([pscustomobject]@{ event = 'recycle_verify'; drive = 'K:' })).Length -gt 0)
 
-# ---- 7. the two requirements are actually wired, not just present ------------
+# ---- 8. the two requirements are actually wired, not just present ------------
 # Asserted against the source because the end-to-end section above cannot reach
 # these: it has no real failing disk to point at, and it cannot make a real purge
 # fail honestly.

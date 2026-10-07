@@ -25,8 +25,6 @@ $cfg = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8) | C
 
 . (Lift-Functions -Script 'balance.ps1' -Names @('Get-Prop', 'Test-Forward', 'Test-Shed'))
 ''
-$script:GivenBack = @{}
-
 # Rebuild the drive objects exactly as balance.ps1 does, then apply the IsLast
 # marking from the NEW config-derived chainMax. Priority 99 / InCascade false is
 # what a drive with no declared priority looks like.
@@ -58,65 +56,143 @@ function Set-IsLast($list) {
 
 $all = @('C:', 'K:', 'D:', 'G:', 'F:', 'H:', 'J:') | ForEach-Object { New-Drive $_ }
 
-# ---- 1. the parking lot must not slide when F: is absent ---------------------
-# The failure state: F: had no headroom and sources:false, so the old code saw
-# only C: K: D: G: and crowned G: as the chain end.
-$withoutF = @($all | Where-Object { $_.Letter -ne 'F:' } | ForEach-Object { $_ | Select-Object * })
-$gAbsent = @($withoutF | Where-Object { $_.Letter -eq 'G:' })[0]
-$maxAbsent = Set-IsLast $withoutF
-Assert-False "F: absent -> G: is not the parking lot" $gAbsent.IsLast
-Assert-Equal  "F: absent -> chainMax still 5 (was 4)" $maxAbsent 5
+# ---- 1. the parking lot must not slide when G: is absent ---------------------
+# The failure state: the chain end comes from config and from nothing else. G:
+# holds the highest declared priority, so when it is unplugged the chain is left
+# without a receiver - which is correct - rather than crowning F: or D: instead,
+# which is the bug that moved four files backwards on 2026-10-04.
+$withoutG = @($all | Where-Object { $_.Letter -ne 'G:' } | ForEach-Object { $_ | Select-Object * })
+$fAbsent = @($withoutG | Where-Object { $_.Letter -eq 'F:' })[0]
+$dAbsent = @($withoutG | Where-Object { $_.Letter -eq 'D:' })[0]
+$maxAbsent = Set-IsLast $withoutG
+Assert-False "G: absent -> F: is NOT crowned instead" $fAbsent.IsLast
+Assert-False "G: absent -> D: is NOT crowned instead" $dAbsent.IsLast
+Assert-Equal "G: absent -> chainMax still 5, read from config" $maxAbsent 5
 
-# ---- 2. when F: is present it owns the role ---------------------------------
+# ---- 2. when G: is present it owns the role ---------------------------------
 Set-IsLast $all | Out-Null
 $byLetter = @{}
 foreach ($d in $all) { $byLetter[$d.Letter] = $d }
-Assert-True  "F: present -> F: is the parking lot" $byLetter['F:'].IsLast
-Assert-False "F: present -> G: is not" $byLetter['G:'].IsLast
+Assert-True  "G: present -> G: is the parking lot" $byLetter['G:'].IsLast
+Assert-False "G: present -> F: is not" $byLetter['F:'].IsLast
 
 # ---- 3. the direction matrix -----------------------------------------------
-# Read off the cascade diagram in COMMANDS.md: C:1 -> K:2 -> D:3 -> G:4 -> F:5,
-# and F: may give back exactly one step. H: and J: declare no priority, so they
-# sit outside the chain and every source may reach them.
+# The whole chain, exactly as specified. Every destination has a higher priority
+# number than its source, or no priority at all and so sits outside the chain.
+# Nothing moves backwards - including the last drive, which used to be permitted
+# one step back as a "give-back".
+#
+#   C: -> D: F: G: H: J: K:
+#   K: -> D: F: G: H: J:
+#   D: -> F: G: H: J:
+#   F: -> G: H: J:
+#   G: -> H: J:
+#   H: -> J:
+#   J: -> nowhere
 $cases = @(
-    @{ f = 'C:'; t = 'D:'; want = $true;  why = 'forward' }
-    @{ f = 'C:'; t = 'K:'; want = $true;  why = 'forward' }
-    @{ f = 'C:'; t = 'F:'; want = $true;  why = 'forward' }
-    @{ f = 'K:'; t = 'D:'; want = $true;  why = 'forward' }
-    @{ f = 'D:'; t = 'G:'; want = $true;  why = 'forward' }
-    @{ f = 'D:'; t = 'F:'; want = $true;  why = 'forward' }
-    @{ f = 'G:'; t = 'F:'; want = $true;  why = 'forward' }
-    @{ f = 'G:'; t = 'D:'; want = $false; why = 'BACKWARDS - the bug' }
+    @{ f = 'C:'; t = 'D:'; want = $true;  why = 'chain' }
+    @{ f = 'C:'; t = 'F:'; want = $true;  why = 'chain' }
+    @{ f = 'C:'; t = 'G:'; want = $true;  why = 'chain' }
+    @{ f = 'C:'; t = 'H:'; want = $true;  why = 'chain' }
+    @{ f = 'C:'; t = 'J:'; want = $true;  why = 'chain' }
+    @{ f = 'C:'; t = 'K:'; want = $true;  why = 'chain' }
+    @{ f = 'K:'; t = 'D:'; want = $true;  why = 'chain' }
+    @{ f = 'K:'; t = 'F:'; want = $true;  why = 'chain' }
+    @{ f = 'K:'; t = 'G:'; want = $true;  why = 'chain' }
+    @{ f = 'K:'; t = 'H:'; want = $true;  why = 'chain' }
+    @{ f = 'K:'; t = 'J:'; want = $true;  why = 'chain' }
+    @{ f = 'D:'; t = 'F:'; want = $true;  why = 'chain' }
+    @{ f = 'D:'; t = 'G:'; want = $true;  why = 'chain' }
+    @{ f = 'D:'; t = 'H:'; want = $true;  why = 'chain' }
+    @{ f = 'D:'; t = 'J:'; want = $true;  why = 'chain' }
+    @{ f = 'F:'; t = 'G:'; want = $true;  why = 'chain' }
+    @{ f = 'F:'; t = 'H:'; want = $true;  why = 'chain' }
+    @{ f = 'F:'; t = 'J:'; want = $true;  why = 'chain' }
+    @{ f = 'G:'; t = 'H:'; want = $true;  why = 'chain' }
+    @{ f = 'G:'; t = 'J:'; want = $true;  why = 'chain' }
+    @{ f = 'H:'; t = 'J:'; want = $true;  why = 'chain' }
+
+    # The rule the user restated after the give-back caused a ping-pong on
+    # 2026-10-06: G: reaches H: and J: and nothing else. Not F:.
+    @{ f = 'G:'; t = 'F:'; want = $false; why = 'RULE: G: -> H: or J: only' }
+    @{ f = 'G:'; t = 'D:'; want = $false; why = 'backwards' }
     @{ f = 'G:'; t = 'K:'; want = $false; why = 'backwards' }
+    @{ f = 'G:'; t = 'C:'; want = $false; why = 'backwards' }
+
+    @{ f = 'J:'; t = 'H:'; want = $true;  why = 'J: is sources:false so this never happens' }
     @{ f = 'D:'; t = 'K:'; want = $false; why = 'backwards' }
+    @{ f = 'D:'; t = 'C:'; want = $false; why = 'backwards' }
     @{ f = 'K:'; t = 'C:'; want = $false; why = 'backwards' }
-    @{ f = 'K:'; t = 'G:'; want = $true;  why = 'forward' }
-    @{ f = 'F:'; t = 'D:'; want = $false; why = 'give back only ONE step' }
-    @{ f = 'F:'; t = 'C:'; want = $false; why = 'two steps back' }
-    @{ f = 'C:'; t = 'H:'; want = $true;  why = 'no priority, outside the chain' }
-    @{ f = 'G:'; t = 'J:'; want = $true;  why = 'no priority, outside the chain' }
+    @{ f = 'F:'; t = 'D:'; want = $false; why = 'backwards' }
+    @{ f = 'F:'; t = 'C:'; want = $false; why = 'backwards' }
+
+    # H: declares NO priority in config.json, so it is outside the chain and a
+    # source with no position is unrestricted. That is the code working as
+    # designed, but it is NOT what the stated chain says: "H: -> J:" implies J:
+    # and nothing else. Asserted here so the gap is visible in the test output
+    # rather than discovered later by noticing a file moved onto F:.
+    @{ f = 'H:'; t = 'F:'; want = $true; why = 'H: is outside the chain - see note below' }
+    @{ f = 'H:'; t = 'G:'; want = $true; why = 'H: is outside the chain - see note below' }
 )
 foreach ($c in $cases) {
     Assert-Equal ("{0} -> {1}  ({2})" -f $c.f, $c.t, $c.why) `
         (Test-Forward -From $byLetter[$c.f] -To $byLetter[$c.t]) $c.want
 }
 
-# ---- 4. the parking-lot gates ----------------------------------------------
-# The demand gate guards the parking lot as a RECEIVER, not as a sender: F: only
-# accepts from G: when something is actually waiting for room on G:. Without it G:
-# would spend every run relocating its own library into a drive that gives
-# nothing back. F: -> G: (giving back) is allowed by Test-Forward alone.
-$candidates = @('D:', 'G:', 'K:', 'H:', 'J:', 'F:')
+# ---- 3b. no backwards move exists among the prioritised drives ---------------
+# The matrix above lists the destinations that matter; this sweeps every ordered
+# pair among the drives that declare a priority and asserts the invariant
+# directly, so adding a drive to config.json cannot quietly open a hole that the
+# list above was not updated for.
+#
+# Drives with no priority are excluded and cannot be swept this way: they are
+# outside the chain by definition, and a source with no position has nothing to be
+# compared against, so every direction is permitted. That is correct for J: (a
+# terminal sink, never a source) and it is the gap for H: - see the note in the
+# matrix above.
+$chained = @('C:', 'K:', 'D:', 'F:', 'G:')
+$backwards = @()
+foreach ($a in $chained) {
+    foreach ($b in $chained) {
+        if ($a -eq $b) { continue }
+        $ok = Test-Forward -From $byLetter[$a] -To $byLetter[$b]
+        $aPrio = $byLetter[$a].Priority
+        $bPrio = $byLetter[$b].Priority
+        # Both in the chain: only a strictly higher number may receive.
+        if ($bPrio -le $aPrio -and $ok) {
+            $backwards += ("{0}({1}) -> {2}({3})" -f $a, $aPrio, $b, $bPrio)
+        }
+    }
+}
+Assert-Equal 'no prioritised drive may move content to an earlier one' ($backwards -join ', ') ''
 
-$noDemand = @($candidates | Where-Object { Test-Shed -From $byLetter['G:'] -To $byLetter[$_] -Demand @{} })
-Assert-True  "G: -> F: blocked while nothing waits on G:" ('F:' -notin $noDemand)
+# G: is the specific case that caused the ping-pong on 2026-10-06. Spelled out on
+# its own so a regression names itself rather than showing up as a list difference.
+Assert-False 'G: cannot reach F: (the one that ping-ponged)' `
+    (Test-Forward -From $byLetter['G:'] -To $byLetter['F:'])
 
-$withDemand = @($candidates | Where-Object { Test-Shed -From $byLetter['G:'] -To $byLetter[$_] -Demand @{ 'G:' = 3 } })
-Assert-True  "G: -> F: allowed when G: is waiting for room" ('F:' -in $withDemand)
+# ---- 4. the demand gate on the last drive ----------------------------------
+# G: is the end of the chain, so it accepts from F: only when something is
+# actually waiting for room on F:. Without that, F: would spend every run
+# relocating its own library into a drive that has nowhere to pass it onward.
+# It gates RECEIVING only; it grants no backwards move, because Test-Forward
+# already refused those before this gate was reached.
+$candidates = @('D:', 'F:', 'K:', 'H:', 'J:', 'G:')
 
-$giveBack = @($candidates | Where-Object { Test-Shed -From $byLetter['F:'] -To $byLetter[$_] -Demand @{} })
-Assert-True  "F: -> G: give-back permitted" ('G:' -in $giveBack)
-Assert-True  "F: -> D: give-back cannot skip a step" ('D:' -notin $giveBack)
+$noDemand = @($candidates | Where-Object { Test-Shed -From $byLetter['F:'] -To $byLetter[$_] -Demand @{} })
+Assert-True  "F: -> G: blocked while nothing waits on F:" ('G:' -notin $noDemand)
+
+$withDemand = @($candidates | Where-Object { Test-Shed -From $byLetter['F:'] -To $byLetter[$_] -Demand @{ 'F:' = 3 } })
+Assert-True  "F: -> G: allowed when F: is waiting for room" ('G:' -in $withDemand)
+
+# The same question asked of G: as a source. H: and J: are outside the chain so
+# they stay reachable; F:, D: and K: are refused no matter what the demand says,
+# because the gate adds a restriction and can never undo the direction check.
+$fromG = @($candidates | Where-Object { Test-Shed -From $byLetter['G:'] -To $byLetter[$_] -Demand @{ 'G:' = 99 } })
+Assert-False "G: -> F: refused even with demand waiting on G:" ('F:' -in $fromG)
+Assert-False "G: -> D: refused even with demand waiting on G:" ('D:' -in $fromG)
+Assert-True  "G: -> H: still reachable, it is outside the chain" ('H:' -in $fromG)
+Assert-True  "G: -> J: still reachable, it is outside the chain" ('J:' -in $fromG)
 
 # ---- 5. a drive with no priority stays unrestricted -------------------------
 $loose = New-Drive 'Z:'

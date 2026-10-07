@@ -57,6 +57,27 @@ function Lift-Pattern {
     throw ("pattern containing '{0}' not found in {1} - the source changed shape" -f $Anchor, (Split-Path $path -Leaf))
 }
 
+# Return the text of a shipping script between two literal anchors, inclusive of
+# the start anchor and exclusive of the end one.
+#
+# Used to assert on how a block of real code is wired without running it - the
+# alternative, copying the logic into the test, is exactly the drift this file
+# exists to prevent. Returns $null rather than throwing when the anchors are not
+# both present, so a caller can fail its own assertion with a useful name instead
+# of the whole suite dying on an error message about a string.
+function Get-SourceBetween {
+    param([string]$Script, [string]$Start, [string]$End)
+
+    $path = if ([System.IO.Path]::IsPathRooted($Script)) { $Script } else { Join-Path $script:TestRoot $Script }
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $src = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+    $i = $src.IndexOf($Start, [System.StringComparison]::Ordinal)
+    if ($i -lt 0) { return $null }
+    $j = if ($End) { $src.IndexOf($End, $i, [System.StringComparison]::Ordinal) } else { $src.Length }
+    if ($j -lt 0) { $j = $src.Length }
+    return $src.Substring($i, $j - $i)
+}
+
 function Assert-Equal {
     param([string]$Name, $Got, $Want)
 

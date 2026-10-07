@@ -9,8 +9,8 @@ server, and never rewrites a library's folder structure beyond recreating the
 folder a file already belonged to.
 
 ```
-C:\Downloads\Movies\  ->  D:\Movies\  ->  G:\Movies\  ->  F:\Movies\
-(landing zone)            (internal)       (NVMe)          (parking lot)
+C:\Downloads\Movies\  ->  K:\Movies\  ->  D:\Movies\  ->  F:\Movies\  ->  G:\Movies\  ->  H:\  ->  J:\
+(landing zone)            (USB)         (internal)       (USB)         (NVMe)       (exFAT)   (stick)
 ```
 
 ---
@@ -90,10 +90,16 @@ from whichever drives happened to be sources on a given run, and when one drive 
 absent the cascade reversed - content moved *uphill*, every hour, planning the same
 move forever. `tests\cascade-direction.ps1` exists to make that unrepeatable.
 
-**The source is deleted only after the copy is verified.** Default verification is
-size plus file count. `balance.ps1 -Hash` compares SHA256 instead, at the cost of
-reading both files end to end. On a failed check the source is kept and the copy is
-left for `reconcile.ps1` to deal with.
+**The source is deleted only after the copy is verified.** Verification is
+`size` by default - file count plus total length - or `hash` for SHA256 of every
+file, set with `"verify": "hash"` in `config.json`. `balance.ps1 -Hash` forces
+hashing for one run regardless of the config. Any value other than `size` or `hash`
+is refused at startup rather than quietly treated as `size`. On a failed check the
+source is kept and the copy is left for `reconcile.ps1` to deal with.
+
+Note that hashing reads every byte of both copies, which on a slow drive is most
+of a large move. It is a real cost, not a formality - `size` catches truncation and
+miscounts, not corruption.
 
 **An interrupted run heals itself.** A partial copy on the destination is detected
 on the next cycle by comparing the same filename across every configured root,
@@ -110,10 +116,22 @@ only place it exists once the shell is out of the picture. **An item whose origi
 cannot be read is left alone.** The format is undocumented by Microsoft, so the
 parser refuses anything it does not recognise rather than guessing.
 
-**Give-backs are remembered.** When the balancer hands a file back up the chain to
-free room for something bigger, it records that in `logs\givenback.json` and will
-not take that file back for 7 days. Otherwise a marginal file ping-pongs between two
-drives every hour, burning hours of I/O and achieving nothing.
+**Downloads are asked about, not guessed at.** A file is held while qBittorrent
+still lists the torrent that owns it - the specific files the torrent contains, not
+its containing folder. Media you have finished watching becomes movable the moment
+you remove the torrent from the client, rather than a flat 24 hours after it was last
+written. If qBittorrent is not running it is started for the check and closed again
+afterwards; if it cannot be reached even then the older time-based rule takes over,
+so a half-written file is never moved. Set `"downloadGuard": {"enabled": false}` to
+turn it off.
+
+**Nothing moves backwards.** Every destination is further along the chain than its
+source, or outside the chain entirely (`H:` and `J:`, which have no priority). There
+is no give-back and no give-back ledger. Both existed, and together they produced
+exactly the ping-pong they were meant to prevent: a file would travel forward, be
+handed back one step, and travel forward again — each copy paid for in full and
+undone an hour later, and the last leg could strand the file on a drive that could
+no longer pass it on.
 
 **One balancer at a time.** `balance.ps1` takes a named mutex. A manual run started
 while the watcher is mid-run reports "already in progress" and exits, rather than
@@ -169,7 +187,9 @@ stay invisible until a real disk failed.
 
 `tests\recycle-bin.ps1` runs the real reclaim pass over a throwaway `subst` volume
 and proves that a personal file, a corrupt header and an orphaned `$I` record all
-survive while library media is destroyed.
+survive while library media is destroyed. It covers both bin layouts - the
+per-account folder that fixed volumes use, and the flat one removable and exFAT
+volumes use.
 
 ---
 
