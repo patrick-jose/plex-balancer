@@ -1,4 +1,4 @@
-# Shared playlist engine. Dot-source this file; it has no startup side effects.
+﻿# Shared playlist engine. Dot-source this file; it has no startup side effects.
 # Personal state and credentials are never stored alongside publishable code.
 function Get-PlaylistProp {
     param($Object, [string]$Name, $Default = $null)
@@ -544,3 +544,4 @@ function Add-PlaylistAlert {
     param([string]$Id, [string]$Message)
     $script:PlaylistAlerts[$Id] = $Message
 }
+

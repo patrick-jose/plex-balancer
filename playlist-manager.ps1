@@ -1,4 +1,4 @@
-# Managed playlist maintenance. Preview by default; -Apply edits only the named
+﻿# Managed playlist maintenance. Preview by default; -Apply edits only the named
 # copy. Never deletes media, changes watch state, or touches Plex's database.
 [CmdletBinding()]
 param(
@@ -193,7 +193,14 @@ try {
     [object[]]$rounds = @(); if ($state) { $rounds = @($state.Rounds) }
     [object[]]$existingMovies = @(); if ($state) { $existingMovies = @($state.Movies) }
     $cursors = @{}
-    if ($state) { foreach ($p in $state.Cursors.PSObject.Properties) { $cursors[$p.Name] = [long]$p.Value } }
+    if ($state -and $state.Cursors) {
+        if ($state.Cursors -is [hashtable]) {
+            foreach ($k in $state.Cursors.Keys) { $cursors[$k] = [long]$state.Cursors[$k] }
+        }
+        else {
+            foreach ($p in $state.Cursors.PSObject.Properties) { $cursors[$p.Name] = [long]$p.Value }
+        }
+    }
     [string[]]$activeIds = @(); if ($state) { $activeIds = @($state.ActiveIds) }
     $cycleConsumed = @(Get-PlaylistProp $state 'CycleConsumed' @())
     $cycleNumber = [int](Get-PlaylistProp $state 'NextCycleNumber' 1)
@@ -304,3 +311,4 @@ finally {
     if ($held) { try { $mutex.ReleaseMutex() } catch { } }
     $mutex.Dispose()
 }
+
