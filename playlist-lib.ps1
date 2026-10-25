@@ -240,6 +240,13 @@ function Get-PlaylistRounds {
                 $blocked[$show.Identity] = "$($show.Title): finished; download a standby replacement"
                 continue
             }
+            # In-production show with no local episodes: block and notify about upcoming content
+            $hasFuture = $status -and $status.Known -and @(Get-PlaylistProp $status 'Future' @()).Count -gt 0
+            if ($hasFuture) {
+                $nextDate = if ($status.NextAirDate) { $status.NextAirDate } else { ($status.Future | Sort-Object AirDate | Select-Object -First 1).AirDate }
+                $blocked[$show.Identity] = "$($show.Title): in production, next episode airs $nextDate; no local content yet"
+                continue
+            }
             $reason = if ($status -and $status.Known -and $status.NextAirDate) { 'waiting until ' + $status.NextAirDate } else { 'no next local episode; update content or verify series status' }
             $blocked[$show.Identity] = "$($show.Title): $reason"
         }
