@@ -21,7 +21,8 @@
     Refreshes itself until you close it or press Ctrl+C.
 
 .PARAMETER Watch
-    Keep refreshing every few seconds. Without it, prints one snapshot.
+    Refresh only when the scheduled task is due, not at a fixed redraw interval.
+    Without it, prints one snapshot.
 
 .EXAMPLE
     .\status.ps1           # one snapshot
@@ -32,8 +33,7 @@
 param(
     [string]$ConfigPath,
     [switch]$Watch,
-    [int]$Tail = 12,
-    [int]$RefreshSeconds = 30
+    [int]$Tail = 12
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,6 +62,53 @@ function Get-Prop {
     $p = $Object.PSObject.Properties[$Name]
     if ($null -eq $p -or $null -eq $p.Value) { return $Default }
     return $p.Value
+}
+
+function Get-StatusWatchDelay {
+    param(
+        $NextRunTime,
+        [datetime]$Now = (Get-Date)
+    )
+    # These are silent schedule checks, NOT display refreshes. Bounded sleeps
+    # also allow newly enabled/rescheduled tasks to be discovered without spinning.
+    if ($null -eq $NextRunTime) { return 60000 }
+    $remaining = ([datetime]$NextRunTime - $Now).TotalMilliseconds
+    if ($remaining -gt 0) {
+        return [int][math]::Max(1, [math]::Min(60000, [math]::Ceiling($remaining)))
+    }
+    return 60000
+}
+
+function Get-StatusNextScheduledRun {
+    try {
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        if ($task.State -eq 'Disabled') { return $null }
+        $time = ($task | Get-ScheduledTaskInfo -ErrorAction Stop).NextRunTime
+        if ($time -gt [datetime]::MinValue) { return $time }
+    }
+    catch { }
+    return $null
+}
+
+function Watch-Status {
+    Show-Snapshot
+    $next = $script:StatusNextRunTime
+    $handled = [datetime]::MinValue
+    if ($null -ne $next -and [datetime]$next -le (Get-Date)) { $handled = [datetime]$next }
+    while ($true) {
+        if ($null -ne $next -and [datetime]$next -gt $handled -and [datetime]$next -le (Get-Date)) {
+            $handled = [datetime]$next
+            Show-Snapshot
+            $next = $script:StatusNextRunTime
+            continue
+        }
+        Start-Sleep -Milliseconds (Get-StatusWatchDelay -NextRunTime $next)
+        $reported = Get-StatusNextScheduledRun
+        # Scheduler may already have advanced to the following run. Do not lose
+        # the deadline that just elapsed, or redraw repeatedly for the same one.
+        if ($null -ne $reported -and $null -ne $next -and [datetime]$next -gt $handled -and [datetime]$next -le (Get-Date)) { continue }
+        $next = $reported
+    }
 }
 
 # ---- failing disks, reported only when they are actually costing something ---
@@ -272,6 +319,7 @@ function Get-LiveRun {
 }
 
 function Show-Snapshot {
+    $script:StatusNextRunTime = $null
     $W = Get-Width
     Clear-Host
     Write-Host ("Plex Balancer status   {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -ForegroundColor Cyan
@@ -318,6 +366,7 @@ function Show-Snapshot {
         $t = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
         $info = $t | Get-ScheduledTaskInfo
         $nextRun = $info.NextRunTime
+        if ($t.State -ne 'Disabled') { $script:StatusNextRunTime = $nextRun }
         Write-Host ("  {0}   state: {1}" -f $taskName, $t.State)
         Write-Host ("  runs as {0} ({1})" -f $t.Principal.UserId, $t.Principal.LogonType)
         Write-Host ("  last run  {0}   result: {1}" -f $info.LastRunTime, $info.LastTaskResult) -ForegroundColor DarkGray
@@ -378,6 +427,23 @@ function Show-Snapshot {
         catch {
             Write-Host ("{0,-5} unavailable" -f $letter) -ForegroundColor DarkGray
         }
+    }
+
+    # Playlist notifications are explicitly requested by the playlist manager's
+    # update/recovery policy. Read local state only; status never scans or edits Plex.
+    $playlistNoticePath = Join-Path $PSScriptRoot 'playlist-data\notifications.json'
+    if (Test-Path -LiteralPath $playlistNoticePath) {
+        Write-Host ''
+        Write-Host 'PLAYLIST NOTIFICATIONS' -ForegroundColor Cyan
+        Write-Host ('-' * $W)
+        try {
+            $notices = [System.IO.File]::ReadAllText($playlistNoticePath) | ConvertFrom-Json
+            if (@($notices.PSObject.Properties).Count) {
+                foreach ($notice in $notices.PSObject.Properties) { Write-Host ('  ' + $notice.Value) -ForegroundColor Yellow }
+            }
+            else { Write-Host '  no pending playlist notices' -ForegroundColor DarkGray }
+        }
+        catch { Write-Host '  could not read playlist notifications' -ForegroundColor Yellow }
     }
 
     # ---- recent log --------------------------------------------------------
@@ -488,13 +554,13 @@ function Show-Snapshot {
 
     if ($Watch) {
         Write-Host ''
-        Write-Host ('refreshing every {0}s - Ctrl+C to stop' -f $RefreshSeconds) -ForegroundColor DarkGray
+        Write-Host 'refreshing only when a scheduled run is due - Ctrl+C to stop' -ForegroundColor DarkGray
     }
 }
 
 if ($Watch) {
     try {
-        while ($true) { Show-Snapshot; Start-Sleep -Seconds $RefreshSeconds }
+        Watch-Status
     }
     finally { Clear-Host }
 }

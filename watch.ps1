@@ -419,6 +419,22 @@ while ($true) {
 
             if ($state.Slack.Count) { Invoke-Balance -WhatIfOnly:$DryRun }
             else { Write-WatchLog 'every sink is at its target - nothing to do' }
+
+            # Playlist maintenance is independent of storage slack and runs only
+            # after copy/reconcile completes. Opt-in, initialized managed copy only.
+            $playlistConfig = Join-Path $PSScriptRoot 'playlist.config.json'
+            $playlistState = Join-Path $PSScriptRoot 'playlist-data\state.json'
+            if ((Test-Path -LiteralPath $playlistConfig) -and (Test-Path -LiteralPath $playlistState)) {
+                $pc = [System.IO.File]::ReadAllText($playlistConfig) | ConvertFrom-Json
+                if (Get-Prop $pc 'maintenanceEnabled' $false) {
+                    $playlistArgs = @('-ConfigPath', $playlistConfig)
+                    if (-not $DryRun) { $playlistArgs += '-Apply' }
+                    Write-WatchLog 'checking managed playlist, missing media and update notifications'
+                    $pr = Invoke-Child -Script (Join-Path $PSScriptRoot 'playlist-manager.ps1') -ScriptArgs $playlistArgs -TimeoutSeconds 900
+                    foreach ($line in $pr.Output) { if ($line) { Write-WatchLog ("  playlist: $line") } }
+                    if ($pr.TimedOut -or $pr.ExitCode -ne 0) { Write-WatchLog 'playlist maintenance did not finish successfully; saved intent is retained for retry' 'WARN' }
+                }
+            }
         }
     }
     catch {

@@ -1,5 +1,10 @@
 # Plex Storage Balancer - Command Reference
 
+Playlist management is documented separately in [PLAYLIST.md](PLAYLIST.md).
+`playlist-manager.ps1` previews by default; `-Apply` maintains only the managed
+copy, with durable queue/recovery state in the private `playlist-data\` folder.
+When enabled locally, the hourly watcher runs it after storage maintenance.
+
 Every command for the toolset in `%USERPROFILE%\plex-balancer`.
 
 **Everything is a dry run unless you pass `-Apply`.** That is deliberate: the
@@ -334,15 +339,14 @@ declines rather than interfering.
 
 ```powershell
 .\status.ps1                           # one snapshot
-.\status.ps1 -Watch                    # live view, refreshes every 30s
-.\status.ps1 -Watch -RefreshSeconds 5  # closer look while diagnosing
+.\status.ps1 -Watch                    # redraw only when a scheduled run is due
 .\status.ps1 -Tail 30                  # more log history
 ```
 
 | Switch | Default | Effect |
 |---|---|---|
 | `-Watch` | off | Redraw on a timer instead of exiting. |
-| `-RefreshSeconds` | 30 | How often `-Watch` redraws. |
+| `-Watch` timing | scheduled runs only | No fixed-interval display refresh. Silent schedule checks discover rescheduled/disabled tasks without redrawing. `-RefreshSeconds` is no longer supported. |
 | `-Tail` | 12 | How many log lines to show. |
 
 The **DRIVES** table lists drives in the order given by `statusDisplayOrder` in
@@ -489,8 +493,8 @@ about themselves, and stops if any fails:
 ```
 CHECK  preflight
 --------------------------------------------------------------------------
-  ok   17 script(s) parse
-  ok   12 test file(s) are pure ASCII
+  ok   29 script(s) parse
+  ok   17 test file(s) are pure ASCII
   ok   config.example.json parses; local config.json present
 
 SUMMARY
@@ -499,14 +503,19 @@ SUMMARY
   PASS disk-identity          28 ok    0 failed     1,4s
   PASS download-guard         47 ok    0 failed    13,1s
   PASS drive-health           15 ok    0 failed     2,6s
+  PASS empty-source-folders   18 ok    0 failed     1,1s
+  PASS playlist-manager       99 ok    0 failed     2,4s
+  PASS playlist-preview       16 ok    0 failed     1,2s
+  PASS playlist-retirement     8 ok    0 failed     0,7s
   PASS recycle-bin            93 ok    0 failed     2,4s
   PASS retention              36 ok    0 failed     1,2s
   PASS shed-gate              23 ok    0 failed     0,9s
   PASS sink-target            32 ok    0 failed     1,1s
+  PASS status-watch           13 ok    0 failed     0,8s
   PASS verify-mode            27 ok    0 failed     0,9s
   PASS watchdog               16 ok    0 failed     6,4s
 
-  10 suite(s) run, 357 checks reported (357 ok, 0 failed)
+  15 suite(s) run, 511 checks reported (511 ok, 0 failed)
   PASS - every suite reported success
 ```
 
@@ -525,6 +534,11 @@ Three outcomes the summary will not confuse with each other:
 | `tests\cascade-direction.ps1` | Which directions the cascade allows, and that the parking lot does not slide to another drive when the last drive is absent. |
 | `tests\disk-identity.ps1` | Attributing a disk error to the drive that actually caused it when Windows has reassigned disk numbers: the exact 2026-10-06 misattribution, and the limit that errors already logged cannot be re-resolved. |
 | `tests\download-guard.ps1` | The [download guard](#the-download-guard): that a finished torrent still blocks, that a prefix is matched on a separator boundary, that the UTF-8 decode and multi-torrent parsing survive, and that an unreachable client falls back instead of failing open. Source checks cover the PID-based shutdown gate added after a startup race closed a Windows-started client on 2026-10-07; these checks do **not** simulate that race. Talks to `tests\_fake-qbittorrent.ps1`; never touches the real client. |
+| `tests\empty-source-folders.ps1` | After a verified move, empty source Season/Show folders are removed without deleting the library root, other episodes, hidden files, or folders outside that root; dry runs leave everything in place. Uses only temporary files. |
+| `tests\playlist-manager.ps1` | Active/standby TV rounds, bounded random movie/group scheduling, stable recovery identities, provider-status fakes, original/media API guards, atomic state, and real synchronization against a fake Plex backend. |
+| `tests\playlist-preview.ps1` | Read-only discovery's pure 25-show round planner. No live Plex or internet requests. |
+| `tests\playlist-retirement.ps1` | Explicitly confirmed watched-head eligibility; refuses unwatched, ambiguous or concurrently changed queue items. |
+| `tests\status-watch.ps1` | Scheduled-run deadline refresh, normal polling, startup delay/stale-task handling, and the actual watch loop with a fake clock. |
 | `tests\drive-health.ps1` | Reading a disk number out of a Windows error message in both English and Portuguese, and mapping a drive letter to a physical disk. |
 | `tests\shed-gate.ps1` | The demand gate on the last drive: that it blocks when nothing is waiting, opens when something is, and **cannot grant a move the direction check refused** — asserted with the demand figure set absurdly high, which is the ping-pong that happened on 2026-10-06. |
 | `tests\recycle-bin.ps1` | Reading an item's origin out of its `$I` record, including two real header layouts with the paths swapped for invented ones, every shape that must be *refused*, and the whole pass over a throwaway `subst` volume. |

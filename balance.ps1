@@ -769,6 +769,32 @@ function Test-DestinationFree {
     return $null
 }
 
+# Remove empty source folders left behind by a moved episode. Never remove the
+# configured library root, and never recurse: an unexpected file (including a
+# hidden one) must make deletion fail rather than be removed with the folder.
+function Remove-EmptySourceParents {
+    param([string]$SourcePath, [string]$SourceRoot)
+
+    if (-not $SourcePath -or -not $SourceRoot) { return }
+    $root = [System.IO.Path]::GetFullPath($SourceRoot).TrimEnd('\')
+    $parent = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($SourcePath))
+    while ($parent -and $parent.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        try {
+            $dir = [System.IO.DirectoryInfo]::new($parent)
+            if (-not $dir.Exists -or ($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { break }
+            # Directory.Delete(false) is atomic with respect to non-emptiness and
+            # cannot remove files or subfolders even if one appears just now.
+            $dir.Delete($false)
+        }
+        catch [System.IO.IOException] { break } # non-empty or in use
+        catch {
+            Write-Warning "could not remove empty source folder ${parent}: $($_.Exception.Message)"
+            break
+        }
+        $parent = [System.IO.Path]::GetDirectoryName($parent)
+    }
+}
+
 function Invoke-Move {
     param($Unit, [string]$DestRoot, [string]$DestPath, $DriveStat, $DestCfg)
 
@@ -858,6 +884,11 @@ function Invoke-Move {
             Write-Log 'source_delete_failed' @{ path = $Unit.Path; sizeGB = [math]::Round($Unit.Size / $GB, 2); error = $_.Exception.Message }
             Write-Warning "copied but could not remove source: $($Unit.Path)"
             return $false
+        }
+        # A moved episode can leave an empty Season/Show chain behind. The
+        # configured root is never removed, and cleanup cannot undo a good move.
+        if ($Unit.Root) {
+            Remove-EmptySourceParents -SourcePath $Unit.Path -SourceRoot $Unit.Root
         }
     }
 

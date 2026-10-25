@@ -6,7 +6,7 @@ to 100% while another sits empty.
 
 It moves files. It never deletes media, never re-encodes, never touches your Plex
 server, and never rewrites a library's folder structure beyond recreating the
-folder a file already belonged to.
+folder a file already belonged to and removing empty source folders after a move.
 
 ```
 C:\Downloads\Movies\  ->  K:\Movies\  ->  D:\Movies\  ->  F:\Movies\  ->  G:\Movies\  ->  H:\  ->  J:\
@@ -16,6 +16,10 @@ C:\Downloads\Movies\  ->  K:\Movies\  ->  D:\Movies\  ->  F:\Movies\  ->  G:\Mov
 ---
 
 ## Requirements
+
+For managed playlist ordering, missing-item recovery and update notifications,
+see [PLAYLIST.md](PLAYLIST.md). The manager edits only the configured copy with
+`-Apply`; it never deletes media or edits the original manual playlist.
 
 Windows 10 or 11, and nothing else. No modules to install, no runtime, no Python.
 
@@ -96,6 +100,11 @@ file, set with `"verify": "hash"` in `config.json`. `balance.ps1 -Hash` forces
 hashing for one run regardless of the config. Any value other than `size` or `hash`
 is refused at startup rather than quietly treated as `size`. On a failed check the
 source is kept and the copy is left for `reconcile.ps1` to deal with.
+
+After a verified move removes its source file, any now-empty Season/Show folders
+are removed up to (but never including) the configured library root. Folders
+containing other files, including hidden files, are left alone. Dry runs do not
+remove folders.
 
 Note that hashing reads every byte of both copies, which on a slow drive is most
 of a large move. It is a real cost, not a formality - `size` catches truncation and

@@ -1,0 +1,21 @@
+{
+  "serverUrl": "http://127.0.0.1:32400",
+  "tmdbReadToken": "",
+  "tmdbApiKey": "",
+  "sourcePlaylist": "Patrick",
+  "managedPlaylist": "Patrick Automated",
+  "rotationSize": 25,
+  "episodesPerMovie": 5,
+  "randomSeed": 20261024,
+  "replacements": [{ "from": "Beef", "to": "From" }],
+  "thematicGroups": [{
+    "name": "Louis Theroux documentaries",
+    "titlePattern": "^Louis Theroux",
+    "extraTitles": ["My Scientology Movie", "Altered States: Love Without Limits"],
+    "order": "release"
+  }],
+  "scanTimeoutSeconds": 120,
+  "metadataCacheHours": 24,
+  "maintenanceEnabled": false,
+  "watchedFileDeletion": false
+}

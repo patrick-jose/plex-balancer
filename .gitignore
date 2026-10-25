@@ -14,6 +14,12 @@ backup/*
 # back to the example if it is missing.
 config.json
 
+# Personal playlist history, decisions and Plex IDs. Publishable rules/code live
+# in PLAYLIST.md and playlist-preview.ps1; local reports live under logs/.
+PLAYLIST-CONTEXT.local.md
+playlist.config.json
+playlist-data/
+
 # Balancer runtime state, and the disk-identity map the failing-drive gate writes.
 # Both are per-machine: state holds a pid and a phase, and diskmap records which
 # physical disk held each failing disk number.
