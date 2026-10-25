@@ -48,6 +48,24 @@ try {
             }
         }
     }
+    function Force-StopPlexSession {
+        $sessions = Invoke-PlaylistPlex '/status/sessions'
+        foreach ($video in $sessions.SelectNodes('Video')) {
+            $sid = $video.GetAttribute('sessionId')
+            if ($video.GetAttribute('ratingKey') -eq $item.Key -or $video.GetAttribute('guid') -in $item.Ids) {
+                Write-Host "Stopping session $sid playing this episode..."
+                [void](Invoke-PlaylistPlex "/status/sessions/$sid" 'Delete')
+            }
+            else {
+                foreach ($part in $video.SelectNodes('Media/Part')) {
+                    if ($part.GetAttribute('file') -eq $path) {
+                        Write-Host "Stopping session $sid using this file..."
+                        [void](Invoke-PlaylistPlex "/status/sessions/$sid" 'Delete')
+                    }
+                }
+            }
+        }
+    }
     Assert-NotPlaying
     $bytes = ([IO.FileInfo]::new($path)).Length
     "Selected watched head: $Show S${Season}E$Episode - $($item.Title)"
@@ -57,6 +75,8 @@ try {
     # User policy: explicitly confirmed watched-playlist retirement does not
     # consult or start qBittorrent. Storage balancing/recycle guards are separate.
     Assert-NotPlaying
+    Force-StopPlexSession
+    Start-Sleep -Seconds 2  # give Plex time to release the file handle
     $fresh = @(Read-ManagedItems $script:ManagedPlaylistId)
     if (($fresh.Identity -join '|') -cne ($current.Identity -join '|')) { throw 'Playlist changed during safety checks; no deletion performed.' }
 

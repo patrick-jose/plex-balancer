@@ -297,16 +297,13 @@ function Get-PlaylistMovieGroups {
                 foreach ($part in @($c.parts | Sort-Object release_date, id)) {
                     $local = @($Movies | Where-Object { ('tmdb://' + $part.id) -in $_.Ids })
                     if ($local.Count -eq 1 -and -not $assigned.ContainsKey($local[0].Identity)) { $members += $local[0] }
-                    elseif ($part.release_date -and [datetime]$part.release_date -le (Get-Date).Date -and $local.Count -eq 0) {
-                        Add-PlaylistAlert ('collection-missing-' + $id + '-' + $part.id) ("$($c.name): released installment absent locally: $($part.title)")
-                    }
                 }
                 if ($members.Count -gt 1) {
                     $groups += [pscustomobject]@{ Id = 'tmdb:' + $id; Name = $c.name; Kind = 'franchise'; Members = $members
                         Evidence = 'TMDb collection, release/installment order; custom narrative orders require an override' }
                     foreach ($m in $members) { $assigned[$m.Identity] = $true }
                 }
-            } catch { Add-PlaylistAlert ('collection-error-' + $id) 'TMDb collection lookup failed; group not expanded.' }
+            } catch { }
         }
     }
     # Conservative title fallback: same base with numeric/Roman installment
