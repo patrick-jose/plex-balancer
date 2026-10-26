@@ -36,3 +36,9 @@ logs/state.json
 # to this machine - it records which commands you have approved. Nobody else wants
 # it, and 'git add -A' would otherwise pick it up on its own.
 .vscode/
+
+# Machine-specific diagnostic working copies; committed portable templates are
+# supplied alongside these names with a .template suffix.
+/check-mutex.ps1
+/check-standby.ps1
+/verify.py

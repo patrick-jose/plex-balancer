@@ -111,6 +111,9 @@ rewrite the viewing order.
 
 See [PLAYLIST.md](PLAYLIST.md) for the manager commands, durable recovery details,
 and playlist-specific tests. Local queue state and configuration are Git-ignored.
+Portable diagnostic helper templates are committed as `check-mutex.template.ps1`,
+`check-standby.template.ps1`, and `verify.template.py`; machine-specific working
+copies with the shorter names are ignored.
 
 ---
 
