@@ -221,30 +221,34 @@ function Get-PlaylistRounds {
                 continue
             }
             $finished = $status -and $status.Known -and $status.Ended -and $status.Final -gt 0 -and $last -ge $status.Final
+            # Downloadability, not production/status labels, controls replacement:
+            # any released-but-missing episode blocks it; otherwise an exhausted
+            # show may be replaced when an inactive show has downloadable episodes.
+            $noMissing = $status -and $status.Known -and @($status.Missing).Count -eq 0
+            $done = $finished -or $noMissing
             if ($manual) {
                 $candidate = @($Shows | Where-Object { $_.Title -eq $replacement[0].to })
+                # A replacement is eligible only when the Plex library already
+                # contains an unwatched local episode for it; downloadability or
+                # metadata alone is not sufficient.
                 if ($candidate.Count -eq 1 -and $candidate[0].Identity -notin $nextActive.Identity -and $queue[$candidate[0].Identity].Count) {
                     $nextActive = @($nextActive | Where-Object { $_.Identity -ne $show.Identity }) + $candidate[0]
                     $retired += [pscustomobject]@{ From = $show.Title; To = $candidate[0].Title; Round = $number; ManualOverride = $true }
                     continue
                 }
             }
-            elseif ($finished) {
-                $availableStandby = @($Shows | Where-Object { $_.Identity -notin $nextActive.Identity -and $queue[$_.Identity].Count } | Sort-Object SortTitle, Identity)
-                if ($availableStandby.Count) {
-                    $candidate = $availableStandby[0]
+            elseif ($done) {
+                # Stop at the blocker when no replacement is actually available.
+                # If a newly downloaded standby is ready, substitute it into the
+                # active roster; emission below sorts it into the rotation order.
+                $downloadedStandby = @($Shows | Where-Object { $_.Identity -notin $nextActive.Identity -and $queue[$_.Identity].Count } | Sort-Object SortTitle, Identity)
+                if ($downloadedStandby.Count) {
+                    $candidate = $downloadedStandby[0]
                     $nextActive = @($nextActive | Where-Object { $_.Identity -ne $show.Identity }) + $candidate
                     $retired += [pscustomobject]@{ From = $show.Title; To = $candidate.Title; Round = $number; ManualOverride = $false }
                     continue
                 }
-                $blocked[$show.Identity] = "$($show.Title): finished; download a standby replacement"
-                continue
-            }
-            # In-production show with no local episodes: block and notify about upcoming content
-            $hasFuture = $status -and $status.Known -and @(Get-PlaylistProp $status 'Future' @()).Count -gt 0
-            if ($hasFuture) {
-                $nextDate = if ($status.NextAirDate) { $status.NextAirDate } else { ($status.Future | Sort-Object AirDate | Select-Object -First 1).AirDate }
-                $blocked[$show.Identity] = "$($show.Title): in production, next episode airs $nextDate; no local content yet"
+                $blocked[$show.Identity] = "$($show.Title): no downloadable episodes remain; cycle stops here"
                 continue
             }
             $reason = if ($status -and $status.Known -and $status.NextAirDate) { 'waiting until ' + $status.NextAirDate } else { 'no next local episode; update content or verify series status' }
@@ -493,6 +497,78 @@ function Get-PlaylistContinuationContext {
     $offset = $run % 5
     if ($offset -eq 0 -and $lastTv+1 -lt $Queue.Count -and $Queue[$lastTv+1].Type -eq 'movie') { $end++ }
     return [pscustomobject]@{ Prefix=@($Queue | Select-Object -First ($end+1)); Tail=@($Queue | Select-Object -Skip ($end+1)); Offset=$offset }
+}
+
+function Repair-PlaylistQueueBeforeBlockedShow {
+    param([object[]]$Queue, [object[]]$Shows, [string[]]$ActiveIds, [string]$StopShow,
+        [string]$RequiredActiveShow = 'Penn & Teller: Fool Us', [int]$CycleSize = 25, [int]$EpisodesPerMovie = 5)
+    $blocker = @($Shows | Where-Object Title -CEQ $StopShow)
+    if ($blocker.Count -ne 1) { throw "Expected exactly one rotation show named '$StopShow'." }
+    $active = @($Shows | Where-Object Identity -in $ActiveIds | Sort-Object SortTitle, Identity)
+    if ($active.Count -ne $CycleSize) { throw "Expected $CycleSize active shows; found $($active.Count)." }
+    if (@($active | Where-Object Title -CEQ $RequiredActiveShow).Count -ne 1) {
+        throw "Required show '$RequiredActiveShow' is not active; refusing to remove it from the queue."
+    }
+    $blockIndex = -1
+    for ($i = 0; $i -lt $Queue.Count; $i++) {
+        if ($Queue[$i].Type -eq 'episode' -and $Queue[$i].ShowKey -eq $blocker[0].Key) { $blockIndex = $i }
+    }
+    if ($blockIndex -lt 0) { throw "No queued episode found for blocked show '$StopShow'." }
+    $blockTvOrdinal = @($Queue | Select-Object -First ($blockIndex + 1) | Where-Object Type -eq 'episode').Count
+    $cycleNumber = [int][math]::Floor(($blockTvOrdinal - 1) / $CycleSize) + 1
+    $cycleFirstOrdinal = (($cycleNumber - 1) * $CycleSize) + 1
+    $tvOrdinal = 0; $cycleStartIndex = -1
+    for ($i = 0; $i -le $blockIndex; $i++) {
+        if ($Queue[$i].Type -eq 'episode') {
+            $tvOrdinal++
+            if ($tvOrdinal -eq $cycleFirstOrdinal) { $cycleStartIndex = $i; break }
+        }
+    }
+    if ($cycleStartIndex -lt 0) { throw 'Could not locate the blocked show rotation-cycle start.' }
+    $blockerPosition = -1
+    for ($i = 0; $i -lt $active.Count; $i++) { if ($active[$i].Identity -eq $blocker[0].Identity) { $blockerPosition = $i; break } }
+    if ($blockerPosition -lt 0) { throw "Blocked show '$StopShow' is not active." }
+
+    $prefix = @($Queue | Select-Object -First $cycleStartIndex)
+    $cycleItems = @($Queue | Select-Object -Skip $cycleStartIndex -First ($blockIndex - $cycleStartIndex + 1))
+    $cycleEpisodes = @($cycleItems | Where-Object Type -eq 'episode')
+    $cycleMovies = @($cycleItems | Where-Object Type -eq 'movie')
+    $rebuiltCycle = @(); $consumed = @(); $movieIndex = 0
+    $tvCount = @($prefix | Where-Object Type -eq 'episode').Count
+    for ($i = 0; $i -lt $blockerPosition; $i++) {
+        $show = $active[$i]
+        $available = @($cycleEpisodes | Where-Object ShowKey -eq $show.Key | Sort-Object Season, Episode)
+        if (-not $available.Count) { break }
+        $episode = $available[0]
+        $rebuiltCycle += $episode
+        $tvCount++
+        $consumed += $show.Identity
+        if (($tvCount % $EpisodesPerMovie) -eq 0) {
+            if ($movieIndex -ge $cycleMovies.Count) { throw 'The existing movie cadence is incomplete before the blocked show.' }
+            $rebuiltCycle += $cycleMovies[$movieIndex]
+            $movieIndex++
+        }
+    }
+    if (-not $consumed.Count) { throw 'No preceding shows could be retained before the blocker.' }
+    $rebuilt = @($prefix) + @($rebuiltCycle)
+
+    # Keep Penn & Teller in the rotation and repair episode order at its existing
+    # positions; never infer that missing released episodes make it replaceable.
+    $pennSlots = @(); $pennItems = @()
+    for ($i = 0; $i -lt $rebuilt.Count; $i++) {
+        if ($rebuilt[$i].Type -eq 'episode' -and $rebuilt[$i].Show -ceq $RequiredActiveShow) {
+            $pennSlots += $i; $pennItems += $rebuilt[$i]
+        }
+    }
+    $pennItems = @($pennItems | Sort-Object Season, Episode)
+    for ($i = 0; $i -lt $pennSlots.Count; $i++) { $rebuilt[$pennSlots[$i]] = $pennItems[$i] }
+
+    $cursors = @{}
+    foreach ($show in $Shows) {
+        $last = @($rebuilt | Where-Object { $_.Type -eq 'episode' -and $_.ShowKey -eq $show.Key } | Sort-Object Season, Episode | Select-Object -Last 1)
+        if ($last.Count) { $cursors[$show.Identity] = [long]$last[0].Season * 10000 + [long]$last[0].Episode }
+    }
+    return [pscustomobject]@{ Queue = $rebuilt; CycleConsumed = @($consumed); Cursors = $cursors; NextCycleNumber = $cycleNumber }
 }
 
 function Get-PlaylistEpisodeOffset {

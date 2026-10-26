@@ -6,7 +6,8 @@ param(
     [string]$DataDirectory,
     [switch]$Apply,
     [switch]$RecoverOnly,
-    [switch]$AcceptManualOrder
+    [switch]$AcceptManualOrder,
+    [string]$RepairCycleStopBeforeShow
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'playlist-lib.ps1')
@@ -100,6 +101,17 @@ try {
     }
     elseif (-not $RecoverOnly) {
         $state = New-PlaylistContinuationState -Queue $current -Shows $shows -Replacements @($script:PlaylistCfg.replacements) -Server $script:PlaylistBase -SourceId $script:SourcePlaylistId -TargetId $script:ManagedPlaylistId
+    }
+    if ($RepairCycleStopBeforeShow) {
+        if (-not $Apply -or -not $RecoverOnly -or -not $state) { throw 'Cycle-stop repair requires an initialized state and both -RecoverOnly and -Apply.' }
+        $repair = Repair-PlaylistQueueBeforeBlockedShow -Queue @($state.BaseQueue) -Shows $shows -ActiveIds @($state.ActiveIds) -StopShow $RepairCycleStopBeforeShow
+        $state.BaseQueue = @($repair.Queue)
+        $state.Queue = @($repair.Queue)
+        $state.Rounds = @()
+        $state.CycleConsumed = @($repair.CycleConsumed)
+        $state.Cursors = $repair.Cursors
+        $state.NextCycleNumber = $repair.NextCycleNumber
+        Write-Host ("Repairing saved managed queue: stop before {0}; retained {1} items; Penn & Teller retained and episode-sorted." -f $RepairCycleStopBeforeShow, $repair.Queue.Count)
     }
     # Explicit watched retirement is a removal decision, not a recoverable gap.
     # A partial transaction must be inspected rather than re-adding deleted media.

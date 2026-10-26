@@ -45,9 +45,50 @@ Assert-Equal 'one exhausted show stops further complete rounds' @($blocked.Round
 Assert-True 'exhausted continuing/unknown show is not silently retired' ($blocked.Stop[0] -match 'show01')
 $knownEnd = @{}
 $knownEnd[$shows[0].Identity] = [pscustomobject]@{ Known=$true; Ended=$true; Final=10001; Missing=@(); NextAirDate='' }
+$noDownloadedStandby = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes @($short | Where-Object ShowKey -ne $standby.Key) -Original @() -Replacements @() -TvStatus $knownEnd -ActiveIds @($shows.Identity)
+Assert-Equal 'downloadable but not locally downloaded standby cannot replace an exhausted show' @($noDownloadedStandby.Replacements).Count 0
+Assert-True 'cycle remains stopped without a downloaded replacement episode' ($noDownloadedStandby.Stop -match 'show01')
 $auto = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes $short -Original @() -Replacements @() -TvStatus $knownEnd -ActiveIds @($shows.Identity)
-Assert-Equal 'confirmed final episode permits automatic standby replacement' @($auto.Rounds).Count 3
+Assert-Equal 'confirmed exhaustion uses an available downloaded standby' $auto.Replacements[0].To 'show26'
 Assert-False 'metadata-driven replacement is not labeled a manual override' $auto.Replacements[0].ManualOverride
+Assert-True 'replacement joins the rotation in alphabetical order' ($auto.Rounds[1].Episodes[-1].ShowKey -eq 'show26')
+
+$resumeQueue = @($episodes | Where-Object { $_.ShowKey -notin @($shows[0..13].Key) })
+$resumeQueue += @(1..2 | ForEach-Object { Media ('new-resume-' + $_) 'episode' $_ $standby.Key })
+$resumeConsumed = @($shows | Sort-Object SortTitle,Identity | Select-Object -First 13 | ForEach-Object Identity)
+$resumeStatus = @{}; $resumeStatus[$shows[13].Identity] = [pscustomobject]@{ Known=$true; Ended=$false; Final=0; Missing=@(); Future=@(); NextAirDate='' }
+$resumePlan = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes $resumeQueue -Original @() -Replacements @() -TvStatus $resumeStatus -ActiveIds @($shows.Identity) -CycleConsumed $resumeConsumed
+Assert-Equal 'downloaded standby resumes after already-consumed cycle prefix' $resumePlan.Rounds[0].Episodes[0].ShowKey 'show15'
+Assert-Equal 'downloaded standby is sorted into its correct rotation position' $resumePlan.Rounds[0].Episodes[-1].ShowKey 'show26'
+
+$rotationNames = @('The Bear','Castle Rock','Curb Your Enthusiasm','Doctor Who','Euphoria','From','Hacks','House of the Dragon','Impuros',"It's Always Sunny in Philadelphia",'Jury Duty','Lanterns','Louis Theroux: Life on the Edge','Modern Family','New Bandits','Parks and Recreation','Penn & Teller: Fool Us','The Simpsons','The Sopranos','South Park','Spider-Noir','Star Wars: The Clone Wars','Ted Lasso',"Widow's Bay",'X-Men')
+$repairShows = @($rotationNames | ForEach-Object { $s=Media $_ 'show'; if($s.Title -eq 'The Bear'){$s.SortTitle='Bear'}; $s })
+$repairQueue = @(); $repairTv = 0; $repairMovie = 0
+for($cycle=1;$cycle -le 2;$cycle++) {
+    foreach($s in $repairShows) {
+        $epNo = if($s.Title -eq 'Penn & Teller: Fool Us' -and $cycle -eq 1){5} elseif($s.Title -eq 'Penn & Teller: Fool Us'){4} else {$cycle}
+        $repairQueue += (Media ('repair-' + $s.Key + '-' + $cycle) 'episode' $epNo $s.Key)
+        $repairQueue[-1].Show=$s.Title
+        $repairTv++
+        if($repairTv % 5 -eq 0){$repairQueue += (Media ('repair-movie-' + (++$repairMovie))) }
+    }
+}
+foreach($s in $repairShows | Select-Object -First 16) {
+    $thirdEpisode = if($s.Title -eq 'New Bandits'){7}else{3}
+    $repairQueue += (Media ('repair-' + $s.Key + '-3') 'episode' $thirdEpisode $s.Key)
+    $repairQueue[-1].Show=$s.Title
+    $repairTv++
+    if($repairTv % 5 -eq 0){$repairQueue += (Media ('repair-movie-' + (++$repairMovie))) }
+}
+$repair = Repair-PlaylistQueueBeforeBlockedShow -Queue $repairQueue -Shows $repairShows -ActiveIds @($repairShows.Identity) -StopShow 'New Bandits'
+Assert-Equal 'cycle repair stops before the blocked show rather than wrapping to Bear' $repair.Queue[-1].Show 'Modern Family'
+Assert-True 'cycle repair excludes blocked New Bandits from the current cycle' (@($repair.Queue|Where-Object { $_.Show -eq 'New Bandits' -and $_.Season -eq 1 -and $_.Episode -eq 3 }).Count -eq 0)
+Assert-Equal 'cycle repair retains the two complete prior cycles and only the valid preceding shows' @($repair.Queue|Where-Object Type -eq 'episode').Count 64
+$pennRepair=@($repair.Queue|Where-Object Show -eq 'Penn & Teller: Fool Us')
+Assert-Equal 'Penn & Teller remains queued and episode-sorted' ($pennRepair.Season -join ',') '1,1'
+Assert-Equal 'Penn & Teller earlier cycle contains E04 before E05' ($pennRepair.Episode -join ',') '4,5'
+Assert-Equal 'repaired current partial cycle is recorded as consumed through its predecessor' @($repair.CycleConsumed).Count 14
+
 $seed = @($episodes|Where-Object Episode -eq 2)
 $anchored = Get-PlaylistRounds -Shows $shows -Episodes $episodes -Original $seed -Replacements @() -TvStatus @{}
 Assert-Equal 'manual queue anchor prevents older episode reintroduction' $anchored.Rounds[0].Episodes[0].Episode 2

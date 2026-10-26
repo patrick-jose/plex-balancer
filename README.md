@@ -73,6 +73,38 @@ drive letters and folder paths. `config.example.json` is the committed template.
 A normal unattended cycle is `watch.ps1`: reconcile first, then balance, then prune
 expired logs and snapshots.
 
+### Managed Plex playlist
+
+When `maintenanceEnabled` is `true` in the local `playlist.config.json`, the hourly
+watcher also runs `playlist-manager.ps1`. It updates only the configured managed
+playlist; the source playlist and media files are not changed. The manager keeps
+durable queue intent so a temporary Plex or storage problem does not silently
+rewrite the viewing order.
+
+- TV rotation follows alphabetical show order, with episodes ordered by season and
+  episode. It stops at the first blocked show rather than jumping ahead or starting
+  another cycle. A 25-show rotation can therefore pause with 24 usable shows when
+  the next slot is blocked.
+- A standby series can fill that slot only when Plex already has an unwatched
+  episode downloaded locally. Merely being announced, released, or downloadable
+  is not enough. Missing released episodes on the outgoing show also prevent a
+  replacement.
+- Already watched episodes are skipped. For example, after Penn & Teller S11E06
+  and S11E07 were watched, the next queued episode is S11E08; it follows Parks and
+  Recreation S05E04 in the current rotation.
+- Preserve selected movie/franchise order and related documentary sequences, such
+  as the Louis Theroux group. Do not append unrelated random films after the
+  selected sequence ends.
+- A missing Plex playlist entry is not proof that its media was deleted or watched:
+  a drive can be temporarily unavailable, Plex can be rescanning, or a file can
+  move. Keep the item's intended queue position, notify and retry recovery when
+  storage is accessible. Do not write a shortened playlist while any intended item
+  remains unresolved. Recovery is limited to the managed copy and does not empty
+  Plex trash or delete media.
+
+See [PLAYLIST.md](PLAYLIST.md) for the manager commands, durable recovery details,
+and playlist-specific tests. Local queue state and configuration are Git-ignored.
+
 ---
 
 ## The parts that are not obvious
