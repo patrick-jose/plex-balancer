@@ -250,12 +250,15 @@ relevant move history locally without storing credentials.
   edit/reconciliation policy needs agreement before enabling write mode.
 
 Recovery edits are limited to the managed copy. The manager shares the balancer
-mutex, matches stable provider/Plex GUIDs rather than ratingKey alone, checks
-file presence, searches equivalent paths across the section's library roots,
-requests targeted scans for existing files and polls scanner state with a timeout.
-An unresolved item pauses playlist writes and preserves intended positions; it
-never silently removes missing media. Same-relative-path cross-disk moves are
-covered; arbitrary renamed files may still require a manual scan/rematch.
+mutex and matches stable provider/Plex GUIDs rather than relying on a stale
+ratingKey or path. When an intended item is absent from Plex, or Plex still lists
+it with a path that is no longer available, the manager refreshes the affected
+Plex library section and waits for the scan with a timeout. It then rereads the
+Plex library and resolves the item again by stable identity. If the item reappears,
+the managed playlist can be repaired at its intended position. If it does not,
+the manager reports the unresolved item, keeps its queue intent, and pauses
+playlist writes; it does not search the computer's drives for the old path or
+silently remove the entry. The original manual playlist is never written.
 
 Every apply saves intent and snapshots BEFORE any mutation and verifies the full
 result afterward. If Plex returns success for an ineffective item move, the

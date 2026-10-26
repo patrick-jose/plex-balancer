@@ -53,26 +53,22 @@ try {
         @(Get-PlaylistPlexItems "/playlists/$Id/items?includeGuids=1" | ForEach-Object { Convert-PlaylistMedia $_ })
     }
 
-    function Get-RecoveryFolders {
-        param($Item)
-        $section = @($script:PlaylistSections | Where-Object { $_.GetAttribute('key') -eq $Item.SectionId })
-        if ($section.Count -ne 1) { return @() }
-        $roots = @($section[0].SelectNodes('Location') | ForEach-Object { $_.GetAttribute('path').TrimEnd('\') })
-        $candidates = @()
-        foreach ($old in $Item.Paths) {
-            foreach ($root in $roots) {
-                if (-not $old.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
-                $relative = $old.Substring($root.Length).TrimStart('\')
-                foreach ($target in $roots) {
-                    $path = Join-Path $target $relative
-                    # Do not scan an entire offline drive or a root whose known
-                    # file has disappeared. A moved file can be on any library root.
-                    $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($path))
-                    if ($drive.IsReady -and [IO.File]::Exists($path)) { $candidates += [IO.Path]::GetDirectoryName($path) }
-                }
-            }
+    function Update-PlaylistLibrarySection {
+        param([string]$SectionId)
+        $sectionsNow = @((Invoke-PlaylistPlex '/library/sections').SelectNodes('Directory'))
+        $section = @($sectionsNow | Where-Object { $_.GetAttribute('key') -eq $SectionId })
+        if ($section.Count -ne 1) { return $false }
+        if ($section[0].GetAttribute('refreshing') -notin @('1','true')) {
+            [void](Invoke-PlaylistPlex ("/library/sections/{0}/refresh" -f $SectionId))
         }
-        return @($candidates | Select-Object -Unique)
+        $deadline = (Get-Date).AddSeconds([int]$script:PlaylistCfg.scanTimeoutSeconds)
+        Start-Sleep -Seconds 2
+        do {
+            $sectionsNow = @((Invoke-PlaylistPlex '/library/sections').SelectNodes('Directory'))
+            $scanning = @($sectionsNow | Where-Object { $_.GetAttribute('key') -eq $SectionId -and $_.GetAttribute('refreshing') -in @('1','true') }).Count -gt 0
+            if ($scanning) { Start-Sleep -Seconds 2 }
+        } while ($scanning -and (Get-Date) -lt $deadline)
+        return (-not $scanning)
     }
 
     $playlists = @(Get-PlaylistPlexItems '/playlists' 'Playlist')
@@ -151,25 +147,19 @@ try {
     # simply because a disk vanished, Plex lost a ratingKey, or a scan is delayed.
     $unresolved = @()
     $recovered = @()
+    $refreshedSections = @{}
     if ($state) {
         foreach ($wanted in @($state.Queue)) {
             $found = Resolve-PlaylistMedia $wanted $library
-            if (-not $found -and $Apply) {
-                $folders = @(Get-RecoveryFolders $wanted)
-                if ($folders.Count) {
-                    foreach ($folder in $folders) {
-                        [void](Invoke-PlaylistPlex ("/library/sections/{0}/refresh?path={1}" -f $wanted.SectionId, [uri]::EscapeDataString($folder)))
-                    }
-                    $deadline = (Get-Date).AddSeconds([int]$script:PlaylistCfg.scanTimeoutSeconds)
-                    # Give an asynchronous scanner time to start before checking.
-                    Start-Sleep -Seconds 2
-                    do {
-                        $sectionsNow = @((Invoke-PlaylistPlex '/library/sections').SelectNodes('Directory'))
-                        $scanning = @($sectionsNow | Where-Object { $_.GetAttribute('key') -eq $wanted.SectionId -and $_.GetAttribute('refreshing') -in @('1','true') }).Count -gt 0
-                        if ($scanning) { Start-Sleep -Seconds 2 }
-                    } while ($scanning -and (Get-Date) -lt $deadline)
-                    if (-not $scanning) { $library = @(Read-ManagedLibrary); $found = Resolve-PlaylistMedia $wanted $library }
+            if ((-not $found -or ($found -and -not (Test-PlaylistMediaPresent $found))) -and $Apply) {
+                $sectionId = [string]$wanted.SectionId
+                if (-not $refreshedSections.ContainsKey($sectionId)) {
+                    # Plex section refresh is the recovery mechanism; do not
+                    # search local roots for the item's former path.
+                    $refreshedSections[$sectionId] = Update-PlaylistLibrarySection $sectionId
+                    if ($refreshedSections[$sectionId]) { $library = @(Read-ManagedLibrary) }
                 }
+                if ($refreshedSections[$sectionId]) { $found = Resolve-PlaylistMedia $wanted $library }
             }
             if ($found) { $recovered += $found }
             else {
@@ -238,10 +228,18 @@ try {
     $desired = @()
     if ($RecoverOnly -or $unresolved.Count) { if ($state) { $desired = @($state.Queue) } }
     else { $desired = @(Merge-PlaylistContinuation -BaseQueue @($state.BaseQueue) -Rounds $rounds -Movies @($moviePlan.Movies)) }
-    # Resolve old round/movie records through stable IDs after any cross-disk scan.
+    # Resolve old round/movie records through stable IDs after any Plex section refresh.
     $resolvedDesired = @()
     foreach ($wanted in $desired) {
         $found = Resolve-PlaylistMedia $wanted $library
+        if ($found -and -not (Test-PlaylistMediaPresent $found) -and $Apply -and -not $refreshedSections.ContainsKey([string]$found.SectionId)) {
+            $sectionId = [string]$found.SectionId
+            $refreshedSections[$sectionId] = Update-PlaylistLibrarySection $sectionId
+            if ($refreshedSections[$sectionId]) {
+                $library = @(Read-ManagedLibrary)
+                $found = Resolve-PlaylistMedia $wanted $library
+            }
+        }
         if ($found) {
             $resolvedDesired += $found
             if (-not (Test-PlaylistMediaPresent $found)) {
