@@ -4,9 +4,11 @@ A PowerShell tool that moves already-optimised media between drives to hit
 per-drive free-space targets, so a multi-drive Plex library stops filling one disk
 to 100% while another sits empty.
 
-It moves files. It never deletes media, never re-encodes, never touches your Plex
-server, and never rewrites a library's folder structure beyond recreating the
-folder a file already belonged to and removing empty source folders after a move.
+Storage balancing moves files without deleting media, re-encoding, or touching
+Plex. Its only folder changes are recreating the file's existing folder at the
+destination and removing empty source folders after a verified move. The separate
+managed-playlist feature has an opt-in watched-head retirement setting; see
+[Managed Plex playlist](#managed-plex-playlist).
 
 ```
 C:\Downloads\Movies\  ->  K:\Movies\  ->  D:\Movies\  ->  F:\Movies\  ->  G:\Movies\  ->  H:\  ->  J:\
@@ -101,6 +103,11 @@ rewrite the viewing order.
   storage is accessible. Do not write a shortened playlist while any intended item
   remains unresolved. Recovery is limited to the managed copy and does not empty
   Plex trash or delete media.
+- Watched queue-head retirement is part of playlist maintenance. With
+  `watchedFileDeletion: true`, an apply permanently deletes consecutive watched
+  episode files at the managed queue head after Plex session checks and with a
+  durable recovery transaction. It never skips past an unwatched head item. Set
+  the option `false` to keep media files untouched.
 
 See [PLAYLIST.md](PLAYLIST.md) for the manager commands, durable recovery details,
 and playlist-specific tests. Local queue state and configuration are Git-ignored.

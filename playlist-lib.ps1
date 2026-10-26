@@ -454,6 +454,14 @@ function New-PlaylistContinuationState {
         DeletionEnabled = $false; Applied = $false }
 }
 
+function Get-PlaylistWatchedQueueHead {
+    param([object[]]$Queue)
+    if (-not $Queue.Count) { return $null }
+    $head = $Queue[0]
+    if ($head.Type -ne 'episode' -or -not $head.Watched) { return $null }
+    return $head
+}
+
 function Get-PlaylistRetirementCandidate {
     param([object[]]$Current, $State, [string]$Show, [int]$Season, [int]$Episode, [bool]$Confirmed)
     if (-not $Confirmed) { throw 'User confirmation of playlist viewing is required.' }

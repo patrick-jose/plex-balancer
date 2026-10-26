@@ -4,6 +4,12 @@ $ErrorActionPreference='Stop'
 $head=[pscustomobject]@{Identity='head';Type='episode';Show='Spider-Noir';Season=1;Episode=4;Watched=$true;Paths=@('D:\TV\one.mkv')}
 $next=[pscustomobject]@{Identity='next';Type='episode';Show='Clone Wars';Season=2;Episode=6;Watched=$false;Paths=@('D:\TV\two.mkv')}
 $state=[pscustomobject]@{Queue=@($head,$next);BaseQueue=@($head,$next)}
+$automaticHead=Get-PlaylistWatchedQueueHead @($head,$next)
+Assert-Equal 'automatic retirement selects only the watched queue head' $automaticHead.Identity 'head'
+$automaticHead=Get-PlaylistWatchedQueueHead @($next,$head)
+Assert-Equal 'automatic retirement never skips an unwatched head' $automaticHead $null
+$movie=[pscustomobject]@{Identity='movie';Type='movie';Watched=$true}
+Assert-Equal 'automatic retirement never removes a movie head' (Get-PlaylistWatchedQueueHead @($movie,$head)) $null
 $candidate=Get-PlaylistRetirementCandidate @($head,$next) $state 'Spider-Noir' 1 4 $true
 Assert-Equal 'only the explicitly confirmed watched head is selected' $candidate.Identity 'head'
 $bad=$false;try{Get-PlaylistRetirementCandidate @($head,$next) $state 'Spider-Noir' 1 4 $false}catch{$bad=$true}

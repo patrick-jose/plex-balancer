@@ -1,5 +1,5 @@
 ﻿# Managed playlist maintenance. Preview by default; -Apply edits only the named
-# copy. Never deletes media, changes watch state, or touches Plex's database.
+# copy. Watched-head file retirement is opt-in via playlist.config.json.
 [CmdletBinding()]
 param(
     [string]$ConfigPath,
@@ -19,7 +19,6 @@ $serverUri = [uri]$script:PlaylistBase
 if ($serverUri.Scheme -notin @('http','https') -or $serverUri.UserInfo -or $serverUri.Query) { throw 'Invalid Plex server URL.' }
 if ($script:PlaylistCfg.sourcePlaylist -ceq $script:PlaylistCfg.managedPlaylist) { throw 'Source and managed playlists must be different.' }
 if ([int]$script:PlaylistCfg.rotationSize -ne 25 -or [int]$script:PlaylistCfg.episodesPerMovie -ne 5) { throw 'This manager implements 25 shows and five episodes per movie.' }
-if (Get-PlaylistProp $script:PlaylistCfg 'watchedFileDeletion' $false) { throw 'Watched-file deletion is not approved/configured and cannot be enabled here.' }
 $token = $env:PLEX_TOKEN
 if (-not $token) { $token = (Get-ItemProperty 'HKCU:\Software\Plex, Inc.\Plex Media Server' -ErrorAction SilentlyContinue).PlexOnlineToken }
 if (-not $token) { throw 'No Plex token available.' }
@@ -69,6 +68,86 @@ try {
             if ($scanning) { Start-Sleep -Seconds 2 }
         } while ($scanning -and (Get-Date) -lt $deadline)
         return (-not $scanning)
+    }
+
+    function Invoke-AutomaticRetirement {
+        param([object[]]$Desired, $State, [string]$StatePath, [string]$DataDirectory)
+        $mainCfg = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'config.json')) | ConvertFrom-Json
+        $removed = 0
+        while ($true) {
+            if ($Desired.Count -eq 0) { break }
+            $head = Get-PlaylistWatchedQueueHead $Desired
+            if (-not $head) { break }  # never skip past an unwatched/non-episode head
+            if (@($head.Paths).Count -ne 1) { Write-Warning "Head episode has multiple/unknown paths, skipping retirement"; break }
+            $path = [IO.Path]::GetFullPath($head.Paths[0])
+            $rootMatches = @($mainCfg.libraries.roots | ForEach-Object { $_ } | Where-Object { $path.StartsWith($_.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase) })
+            if (-not $rootMatches.Count -or -not [IO.File]::Exists($path)) { Write-Warning "Head episode file missing, skipping retirement"; break }
+            if (([IO.FileInfo]::new($path).Attributes -band [IO.FileAttributes]::ReparsePoint)) { Write-Warning "Head episode is a reparse point, skipping retirement"; break }
+            $bytes = ([IO.FileInfo]::new($path)).Length
+            # Verify the managed queue still has the exact intended order before
+            # any destructive action; this is a queue-head retirement only.
+            $remaining = @(Read-ManagedItems $script:ManagedPlaylistId)
+            if (($remaining.Identity -join '|') -cne ($Desired.Identity -join '|')) { throw 'Managed playlist changed before watched-head retirement; no media deleted.' }
+            $sessions = Invoke-PlaylistPlex '/status/sessions'
+            foreach ($video in $sessions.SelectNodes('Video')) {
+                if ($video.GetAttribute('ratingKey') -eq $head.Key -or $video.GetAttribute('guid') -in $head.Ids) {
+                    Write-Host "Stopping session $($video.GetAttribute('sessionId')) playing head episode..."
+                    [void](Invoke-PlaylistPlex "/status/sessions/$($video.GetAttribute('sessionId'))" 'Delete')
+                }
+                else {
+                    foreach ($part in $video.SelectNodes('Media/Part')) {
+                        if ($part.GetAttribute('file') -eq $path) {
+                            Write-Host "Stopping session $($video.GetAttribute('sessionId')) using head episode file..."
+                            [void](Invoke-PlaylistPlex "/status/sessions/$($video.GetAttribute('sessionId'))" 'Delete')
+                        }
+                    }
+                }
+            }
+            Start-Sleep -Seconds 2
+            $sessions = Invoke-PlaylistPlex '/status/sessions'
+            $stillPlaying = $false
+            foreach ($video in $sessions.SelectNodes('Video')) {
+                if ($video.GetAttribute('ratingKey') -eq $head.Key -or $video.GetAttribute('guid') -in $head.Ids) { $stillPlaying = $true }
+                foreach ($part in $video.SelectNodes('Media/Part')) { if ($part.GetAttribute('file') -eq $path) { $stillPlaying = $true } }
+            }
+            if ($stillPlaying) { Write-Warning 'Watched head is still in an active Plex session; skipping retirement'; break }
+
+            $transactionPath = Join-Path $DataDirectory ('retirement-' + $head.Key + '.json')
+            if (Test-Path -LiteralPath $transactionPath) { throw "Retirement transaction already exists for $($head.Key); inspect before retrying." }
+            $transaction = [pscustomobject]@{ At=(Get-Date).ToString('o'); Item=$head; Path=$path; Bytes=$bytes
+                Reason='Automatic retirement: watched managed-playlist head; no active session; torrent check omitted by user policy'
+                Status='Pending'; Deleted=$false; QueueUpdated=$false }
+            Write-PlaylistJson (Join-Path $DataDirectory ('before-retirement-'+$head.Key+'.json')) $State
+            Write-PlaylistJson $transactionPath $transaction
+            # Delete file with exclusive handle + DeleteOnClose
+            try {
+                $handle = [IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None,4096,[IO.FileOptions]::DeleteOnClose)
+                $handle.Dispose()
+                if ([IO.File]::Exists($path)) { throw 'File still exists after DeleteOnClose; transaction retained for inspection.' }
+            }
+            catch {
+                throw ("Watched-head retirement failed for " + $path + ": " + $_.Exception.Message + "; transaction retained for inspection.")
+            }
+            $transaction.Deleted = $true; $transaction.Status = 'FileDeleted'
+            Write-PlaylistJson $transactionPath $transaction
+            Write-Host "Auto-retired watched head: $($head.Show) S$($head.Season)E$($head.Episode) - $($head.Title) ($([math]::Round($bytes/1GB,2)) GB)"
+            $removed++
+            # Persist the tombstone before repairing the playlist so an
+            # interrupted update cannot reintroduce media that was deleted.
+            $Desired = @($Desired | Select-Object -Skip 1)
+            $State.Queue = $Desired
+            $State.BaseQueue = @($State.BaseQueue | Where-Object Identity -ne $head.Identity)
+            $State | Add-Member -NotePropertyName Retired -NotePropertyValue (@(Get-PlaylistProp $State 'Retired' @()) + $transaction) -Force
+            $State.At=(Get-Date).ToString('o'); $State.Applied=$false
+            Write-PlaylistJson $StatePath $State
+            $remaining = @(Read-ManagedItems $script:ManagedPlaylistId)
+            [void](Set-PlaylistIntendedItems -Desired $Desired -Current $remaining)
+            $State.Applied=$true
+            Write-PlaylistJson $StatePath $State
+            $transaction.QueueUpdated=$true; $transaction.Status='Complete'
+            Write-PlaylistJson $transactionPath $transaction
+        }
+        if ($removed -gt 0) { Write-Host "Auto-retired $removed watched head episode(s)." }
     }
 
     $playlists = @(Get-PlaylistPlexItems '/playlists' 'Playlist')
@@ -316,6 +395,11 @@ try {
     "Managed copy: $($script:PlaylistCfg.managedPlaylist); apply=$Apply; verified=$($result.Verified)"
     "New episodes=$($result.AddedEpisodes), movies=$(@($moviePlan.Movies).Count), intended=$($desired.Count), add=$($result.Adds), remove from copy=$($result.RemovesFromCopy)"
     "Reports and durable intent: $script:PlaylistData"
+
+    # Automatic retirement of watched episodes at the head of the playlist
+    if ($Apply -and -not $RecoverOnly -and (Get-PlaylistProp $script:PlaylistCfg 'watchedFileDeletion' $false)) {
+        Invoke-AutomaticRetirement -Desired $desired -State $candidate -StatePath $statePath -DataDirectory $script:PlaylistData
+    }
 }
 finally {
     if ($held) { try { $mutex.ReleaseMutex() } catch { } }

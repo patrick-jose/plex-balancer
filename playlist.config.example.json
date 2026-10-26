@@ -17,5 +17,5 @@
   "scanTimeoutSeconds": 120,
   "metadataCacheHours": 24,
   "maintenanceEnabled": false,
-  "watchedFileDeletion": false
+  "watchedFileDeletion": true
 }

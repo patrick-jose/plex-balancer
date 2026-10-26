@@ -45,8 +45,11 @@ by itself enable automatic removal while the deletion/removal policy is disabled
 
 This feature is separate from drive balancing. `playlist-manager.ps1` previews
 by default and maintains only the configured managed copy with `-Apply`. It never
-changes the original playlist, watch state or media files. Watched-file deletion
-is deliberately disabled until the user identity and deletion policy are agreed.
+changes the original playlist or watch state. Media deletion is controlled by
+`watchedFileDeletion` in the private playlist config; it is enabled by default.
+A successful apply retires consecutive Plex-watched episode files at the managed
+queue head; it never skips an unwatched/non-episode head. Set the option to `false`
+to disable file retirement while keeping playlist organization enabled.
 
 An explicit, narrowly scoped watched retirement is now available separately:
 
@@ -71,7 +74,9 @@ S02E06 was playing. That one file was deleted and the managed entry removed.
 The remaining original order was verified, Clone Wars remained playing, and no
 watch flags were altered. Deleting shared media naturally makes it unavailable
 from any other playlist referencing it; no original-playlist API edit is made.
-Global automatic watched-file deletion still remains disabled.
+This explicit command remains available when automatic watched-head retirement is
+disabled. Both paths use durable transactions; interrupted deletions pause recovery
+for inspection rather than reintroducing a deleted item.
 
 ```powershell
 # First copy playlist.config.example.json to playlist.config.json and edit it.
