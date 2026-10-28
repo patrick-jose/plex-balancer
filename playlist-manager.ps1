@@ -226,6 +226,7 @@ try {
     # simply because a disk vanished, Plex lost a ratingKey, or a scan is delayed.
     $unresolved = @()
     $recovered = @()
+    $deletedMovieSlots = @()
     $refreshedSections = @{}
     if ($state) {
         foreach ($wanted in @($state.Queue)) {
@@ -242,8 +243,22 @@ try {
             }
             if ($found) { $recovered += $found }
             else {
-                $unresolved += $wanted
-                Add-PlaylistAlert ('unresolved-' + $wanted.Identity) ("Missing/ambiguous item: $($wanted.Show) $($wanted.Title). Expected: $($wanted.Paths -join ', '). Check disks/library. No playlist write until recovery is complete.")
+                $knownGroupMember = @($state.Groups | Where-Object { @($_.Members | ForEach-Object Identity) -contains $wanted.Identity }).Count -gt 0
+                $sourceVolumeReady = $false
+                if (@($wanted.Paths).Count -eq 1) {
+                    try { $sourceVolumeReady = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($wanted.Paths[0])).IsReady } catch { $sourceVolumeReady = $false }
+                }
+                $deletedStandaloneMovie = $Apply -and $state.Applied -and $wanted.Type -eq 'movie' -and
+                    $wanted.Identity -notin $current.Identity -and -not $knownGroupMember -and $sourceVolumeReady -and
+                    $refreshedSections[[string]$wanted.SectionId]
+                if ($deletedStandaloneMovie) {
+                    $deletedMovieSlots += $wanted
+                    Add-PlaylistAlert ('movie-filler-replacement-' + $wanted.Identity) ("Plex no longer lists deleted standalone movie '$($wanted.Title)', and its managed-playlist entry is gone. Its slot will receive a random standalone movie; franchise selections are unchanged.")
+                }
+                else {
+                    $unresolved += $wanted
+                    Add-PlaylistAlert ('unresolved-' + $wanted.Identity) ("Missing/ambiguous item: $($wanted.Show) $($wanted.Title). Expected: $($wanted.Paths -join ', '). Check disks/library. No playlist write until recovery is complete.")
+                }
             }
         }
     }
@@ -294,6 +309,29 @@ try {
         foreach ($change in $newRounds.Replacements) { Add-PlaylistAlert ('replacement-' + $change.From) ("Round $($change.Round): $($change.From) replaced by $($change.To). Manual override: $($change.ManualOverride).") }
         $rounds += @($newRounds.Rounds)
         $groups = @(Get-PlaylistMovieGroups -Movies $movies -ThematicGroups @($script:PlaylistCfg.thematicGroups))
+        if ($deletedMovieSlots.Count) {
+            $deletedIds = @($deletedMovieSlots | ForEach-Object Identity)
+            $groupedIds = @($groups | ForEach-Object { $_.Members } | ForEach-Object Identity)
+            $groupedIds += @($state.Groups | ForEach-Object { $_.Members } | ForEach-Object Identity)
+            $usedIds = @($state.Movies | Where-Object { $_.Identity -notin $deletedIds } | ForEach-Object Identity)
+            $standalonePool = @($movies | Where-Object { -not $_.Watched -and $_.Identity -notin $usedIds -and $_.Identity -notin $groupedIds })
+            $replacementPlan = Get-PlaylistMovies -Movies $standalonePool -Groups @() -Slots $deletedIds.Count -Seed ([int]$script:PlaylistCfg.randomSeed)
+            if (@($replacementPlan.Movies).Count -ne $deletedIds.Count) {
+                $unresolved += $deletedMovieSlots
+                $moviePlan.Stop = 'Not enough unwatched standalone movies to replace deleted filler slots; saved queue retained.'
+                Add-PlaylistAlert 'movie-filler-shortage' $moviePlan.Stop
+            }
+            else {
+                $repairedMovies = Replace-PlaylistMissingMovieSlots -Queue @($state.Queue) -MovieOrder @($state.Movies) -MissingIdentities $deletedIds -Replacements @($replacementPlan.Movies)
+                $state.Queue = @($repairedMovies.Queue)
+                $state.BaseQueue = @($repairedMovies.Queue)
+                $state.Movies = @($repairedMovies.Movies)
+                $existingMovies = @($state.Movies)
+                for ($i = 0; $i -lt $deletedMovieSlots.Count; $i++) {
+                    Add-PlaylistAlert ('movie-filler-replacement-' + $deletedIds[$i]) ("Replaced deleted filler '$($deletedMovieSlots[$i].Title)' with random standalone movie '$($replacementPlan.Movies[$i].Title)' in the same slot.")
+                }
+            }
+        }
         # Keep the user's existing random movie choices as the initial draw order.
         # They are preferences, NOT permission to append the whole copied tail.
         $baseMovieCount = @($state.BaseQueue | Where-Object Type -eq 'movie').Count

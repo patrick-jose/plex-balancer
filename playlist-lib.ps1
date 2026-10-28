@@ -178,7 +178,7 @@ function Get-PlaylistRounds {
         [string[]]$CycleConsumed = @())
     $standby = @($Replacements | ForEach-Object { $_.to })
     $active = if ($ActiveIds.Count) { @($Shows | Where-Object { $_.Identity -in $ActiveIds }) } else { @($Shows | Where-Object { $_.Title -notin $standby }) }
-    if ($active.Count -ne $Count) { throw "Rotation needs $Count active shows; found $($active.Count). Configure active/standby replacements explicitly." }
+    $missingActiveIds = @($ActiveIds | Where-Object { $_ -notin $Shows.Identity })
     $queue = @{}
     foreach ($show in $Shows) {
         $seed = @($Original | Where-Object { $_.Type -eq 'episode' -and $_.ShowKey -eq $show.Key } | Sort-Object Season, Episode | Select-Object -First 1)
@@ -198,6 +198,18 @@ function Get-PlaylistRounds {
             $queue[$show.Identity] = @($queue[$show.Identity] | Where-Object { ([long]$_.Season * 10000 + $_.Episode) -notin $futureNumbers })
         }
     }
+    if ($active.Count -lt $Count) {
+        $reason = if ($missingActiveIds.Count) {
+            "TV rotation paused: only $($active.Count) active shows are visible in Plex; a saved active show is missing. Refresh/recover it before changing the roster."
+        } else {
+            "TV rotation paused: only $($active.Count) active shows have downloaded unwatched episodes; $Count are required."
+        }
+        $safeCursors = @{}; foreach ($key in $Cursors.Keys) { $safeCursors[$key] = $Cursors[$key] }
+        $savedActiveIds = if ($missingActiveIds.Count) { @($ActiveIds) } else { @($active.Identity) }
+        return [pscustomobject]@{ Rounds=@(); ActiveIds=$savedActiveIds; Cursors=$safeCursors; Replacements=@()
+            Stop=@($reason); CycleConsumed=@($CycleConsumed); NextCycleNumber=$StartRound }
+    }
+    if ($active.Count -gt $Count) { throw "Rotation needs $Count active shows; found $($active.Count). Configure standby replacements explicitly." }
     $rounds = @()
     $cursor = @{}; foreach ($k in $Cursors.Keys) { $cursor[$k] = $Cursors[$k] }
     $retired = @()
@@ -460,6 +472,27 @@ function Get-PlaylistWatchedQueueHead {
     $head = $Queue[0]
     if ($head.Type -ne 'episode' -or -not $head.Watched) { return $null }
     return $head
+}
+
+function Replace-PlaylistMissingMovieSlots {
+    param([object[]]$Queue, [object[]]$MovieOrder, [string[]]$MissingIdentities, [object[]]$Replacements)
+    if ($MissingIdentities.Count -ne $Replacements.Count) { throw 'Each removed filler movie needs exactly one replacement.' }
+    $updatedQueue = @($Queue)
+    $updatedMovies = @($MovieOrder)
+    $used = @($updatedQueue.Identity | Where-Object { $_ -notin $MissingIdentities })
+    for ($n = 0; $n -lt $MissingIdentities.Count; $n++) {
+        $identity = $MissingIdentities[$n]
+        $oldQueue = @(for ($i = 0; $i -lt $updatedQueue.Count; $i++) { if ($updatedQueue[$i].Identity -eq $identity -and $updatedQueue[$i].Type -eq 'movie') { $i } })
+        $oldMovie = @(for ($i = 0; $i -lt $updatedMovies.Count; $i++) { if ($updatedMovies[$i].Identity -eq $identity) { $i } })
+        if ($oldQueue.Count -ne 1 -or $oldMovie.Count -ne 1) { throw "Expected one queue and movie-order slot for $identity." }
+        $replacement = $Replacements[$n]
+        if ($replacement.Type -ne 'movie' -or $replacement.Watched -or $replacement.Identity -in $used) { throw 'Replacement must be a unique, unwatched movie.' }
+        $updatedQueue[$oldQueue[0]] = $replacement
+        $updatedMovies[$oldMovie[0]] = $replacement
+        $used += $replacement.Identity
+    }
+    if (@($updatedQueue.Identity | Select-Object -Unique).Count -ne $updatedQueue.Count) { throw 'Movie slot replacement created duplicate queue identities.' }
+    return [pscustomobject]@{ Queue = $updatedQueue; Movies = $updatedMovies }
 }
 
 function Get-PlaylistRetirementCandidate {

@@ -28,6 +28,9 @@ Assert-Equal 'round shows are alphabetical' $plan.Rounds[0].Episodes[0].ShowKey 
 Assert-Equal 'numeric episode ordering' $plan.Rounds[0].Episodes[0].Episode 1
 Assert-Equal 'next round advances each show' $plan.Rounds[1].Episodes[0].Episode 2
 Assert-Equal 'round has 25 distinct shows' @($plan.Rounds[0].Episodes.ShowKey|Select-Object -Unique).Count 25
+$only24 = Get-PlaylistRounds -Shows @($shows | Select-Object -First 24) -Episodes $episodes -Original @() -Replacements @() -TvStatus @{}
+Assert-Equal '24 active shows stop the cycle instead of creating a short round' @($only24.Rounds).Count 0
+Assert-True '24-show stop is explained in the planner result' ($only24.Stop[0] -match 'only 24 active shows')
 
 $standby = Media 'show26' 'show'
 $short = @($episodes | Where-Object { $_.ShowKey -ne 'show01' -or $_.Episode -eq 1 })
@@ -52,6 +55,16 @@ $auto = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes $short -Original
 Assert-Equal 'confirmed exhaustion uses an available downloaded standby' $auto.Replacements[0].To 'show26'
 Assert-False 'metadata-driven replacement is not labeled a manual override' $auto.Replacements[0].ManualOverride
 Assert-True 'replacement joins the rotation in alphabetical order' ($auto.Rounds[1].Episodes[-1].ShowKey -eq 'show26')
+
+$slotQueue = @((Media 'slot-episode-1' 'episode' 1 'show01'), (Media 'slot-missing-a'), (Media 'slot-episode-2' 'episode' 2 'show02'), (Media 'slot-missing-b'))
+$slotMovies = @($slotQueue | Where-Object Type -eq 'movie')
+$slotRepair = Replace-PlaylistMissingMovieSlots -Queue $slotQueue -MovieOrder $slotMovies -MissingIdentities @('slot-missing-a','slot-missing-b') -Replacements @((Media 'slot-replacement-a'),(Media 'slot-replacement-b'))
+Assert-Equal 'deleted filler replacement keeps the first queue position' $slotRepair.Queue[1].Identity 'slot-replacement-a'
+Assert-Equal 'deleted filler replacement keeps later queue position' $slotRepair.Queue[3].Identity 'slot-replacement-b'
+Assert-Equal 'movie order receives replacements in the matching slots' ($slotRepair.Movies.Identity -join ',') 'slot-replacement-a,slot-replacement-b'
+$slotBad = $false
+try { Replace-PlaylistMissingMovieSlots -Queue $slotQueue -MovieOrder $slotMovies -MissingIdentities @('slot-missing-a','slot-missing-b') -Replacements @((Media 'slot-replacement-a'),(Media 'slot-replacement-a')) } catch { $slotBad = $true }
+Assert-True 'replacement refuses duplicate random selections' $slotBad
 
 $resumeQueue = @($episodes | Where-Object { $_.ShowKey -notin @($shows[0..13].Key) })
 $resumeQueue += @(1..2 | ForEach-Object { Media ('new-resume-' + $_) 'episode' $_ $standby.Key })
