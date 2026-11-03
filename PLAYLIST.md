@@ -58,6 +58,15 @@ window and sweep later positions in the same run. Items beyond it wait until a
 later run moves them into the window. Set `watchedFileDeletion` to `false` to
 disable file retirement while keeping playlist organization enabled.
 
+Manually removing an unwatched movie from the managed playlist creates a vacancy,
+not a request to disable balancing or restore the removed title. On the next
+manager run, that saved movie slot is filled in place with a randomly selected
+unwatched movie that is available in the library. Selection uses the same
+franchise installment ordering and spacing rules as normal movie planning, and
+reserves show-linked movies for their episode anchors. The replacement preserves
+the other queue entries and their order. Explicit watched retirements are
+excluded, and removed episodes are not treated as movie vacancies.
+
 An explicit, narrowly scoped watched retirement is now available separately:
 
 ```powershell
@@ -332,7 +341,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Run-Tests.ps1 -Suite playl
 
 The manager suite covers roster/standby swaps, missing-episode gating, manual
 anchors, numeric/alphabetical ordering, bounded and stable random movies, group
-spacing, original/media write guards, atomic persistence and the real sync
-algorithm against a fake Plex backend (including missing-item restoration,
-idempotency, ineffective moves and server refusal). It does not test a real disk
+spacing, manual movie-removal replacement and saved-queue hole prevention,
+original/media write guards, atomic persistence and the real sync algorithm
+against a fake Plex backend (including missing-item restoration, idempotency,
+ineffective moves and server refusal). It does not test a real disk
 failure or claim a live TMDb run without credentials.

@@ -614,6 +614,24 @@ function Get-PlaylistSyncOperations {
     return $ops
 }
 
+function Assert-PlaylistBaseQueuePreserved {
+    param([object[]]$BaseQueue, [object[]]$Desired)
+    if (@($BaseQueue.Identity | Select-Object -Unique).Count -ne $BaseQueue.Count) {
+        throw 'Saved managed queue contains duplicates; explicit review required.'
+    }
+    $desiredIndex = 0
+    foreach ($item in $BaseQueue) {
+        while ($desiredIndex -lt $Desired.Count -and $Desired[$desiredIndex].Identity -cne $item.Identity) {
+            $desiredIndex++
+        }
+        if ($desiredIndex -ge $Desired.Count) {
+            throw "Queue proposal omitted or reordered saved managed item '$($item.Identity)'; refusing playlist changes."
+        }
+        $desiredIndex++
+    }
+    return $true
+}
+
 function New-PlaylistContinuationState {
     param([object[]]$Queue, [object[]]$Shows, [object[]]$Replacements,
         [string]$Server, [string]$SourceId, [string]$TargetId)
@@ -726,8 +744,10 @@ function Test-PlaylistSourceMatchesAfterRetirements {
 function Replace-PlaylistMissingMovieSlots {
     param([object[]]$Queue, [object[]]$MovieOrder, [string[]]$MissingIdentities, [object[]]$Replacements)
     if ($MissingIdentities.Count -ne $Replacements.Count) { throw 'Each removed filler movie needs exactly one replacement.' }
-    $updatedQueue = @($Queue)
-    $updatedMovies = @($MovieOrder)
+    $updatedQueue = [object[]]::new($Queue.Count)
+    [Array]::Copy($Queue, $updatedQueue, $Queue.Count)
+    $updatedMovies = [object[]]::new($MovieOrder.Count)
+    [Array]::Copy($MovieOrder, $updatedMovies, $MovieOrder.Count)
     $used = @($updatedQueue.Identity | Where-Object { $_ -notin $MissingIdentities })
     for ($n = 0; $n -lt $MissingIdentities.Count; $n++) {
         $identity = $MissingIdentities[$n]
@@ -742,6 +762,48 @@ function Replace-PlaylistMissingMovieSlots {
     }
     if (@($updatedQueue.Identity | Select-Object -Unique).Count -ne $updatedQueue.Count) { throw 'Movie slot replacement created duplicate queue identities.' }
     return [pscustomobject]@{ Queue = $updatedQueue; Movies = $updatedMovies }
+}
+
+function Get-PlaylistManualMovieRemovals {
+    param([object[]]$Queue, [object[]]$Current, [string[]]$RetiredIdentities = @())
+    $currentIds = @($Current | ForEach-Object Identity)
+    return @($Queue | Where-Object {
+        $_.Type -eq 'movie' -and $_.Identity -notin $currentIds -and $_.Identity -notin $RetiredIdentities
+    } | ForEach-Object Identity)
+}
+
+function Get-PlaylistMovieReplacements {
+    param([object[]]$Movies, [object[]]$Groups, [object[]]$MovieOrder, [string[]]$MissingIdentities,
+        [string[]]$ReservedIdentities = @(), [int]$Seed)
+    if (-not $MissingIdentities.Count) { return @() }
+    $available = @($Movies | Where-Object {
+        -not $_.Watched -and $_.Identity -notin $ReservedIdentities -and
+        $_.Identity -notin $MissingIdentities -and (Test-PlaylistMediaPresent $_)
+    })
+    $prefix = @()
+    $replacements = @()
+    for ($i = 0; $i -lt $MovieOrder.Count; $i++) {
+        $movie = $MovieOrder[$i]
+        if ($movie.Identity -notin $MissingIdentities) {
+            $prefix += $movie
+            continue
+        }
+        $futureQueuedIds = @($MovieOrder | Select-Object -Skip ($i + 1) |
+            Where-Object { $_.Identity -notin $MissingIdentities } | ForEach-Object Identity)
+        $plannerMovies = @($available | Where-Object Identity -notin $futureQueuedIds)
+        $plan = Get-PlaylistMovies -Movies $plannerMovies -Groups $Groups -Slots ($prefix.Count + 1) `
+            -Seed ($Seed + $replacements.Count) -Existing $prefix -ReservedIdentities $ReservedIdentities
+        $next = @($plan.Movies | Select-Object -Skip $prefix.Count -First 1)
+        if (-not $next.Count) {
+            throw "Could not select a replacement for removed movie slot $($movie.Identity): $($plan.Stop)"
+        }
+        $replacements += $next[0]
+        $prefix += $next[0]
+    }
+    if ($replacements.Count -ne $MissingIdentities.Count) {
+        throw 'A removed movie identity is absent from the saved movie order; no replacement plan was produced.'
+    }
+    return $replacements
 }
 
 function Remove-PlaylistMovieSlot {

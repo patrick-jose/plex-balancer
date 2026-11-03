@@ -4,6 +4,9 @@ $ErrorActionPreference = 'Stop'
 
 $managerSource = [IO.File]::ReadAllText((Join-Path $script:TestRoot 'playlist-manager.ps1'))
 Assert-False 'manual managed-playlist edits do not block manager applies' ($managerSource -match 'Manual playlist edits detected|AcceptManualOrder')
+Assert-True 'every proposal is checked against saved managed items before synchronization' ($managerSource -match 'Assert-PlaylistBaseQueuePreserved -BaseQueue')
+$missingMediaBlock = Get-SourceBetween -Script 'playlist-manager.ps1' -Start 'if ($found) { $recovered += $found }' -End '$episodes = @($library | Where-Object Type -eq ''episode'')'
+Assert-False 'missing library media cannot silently delete its saved movie slot' ($missingMediaBlock -match 'Remove-PlaylistMovieSlot|deleted-managed-movie-')
 $initialResult = [pscustomobject]@{ DesiredCount=244; RemovesFromCopy=3; Movies=75 }
 $finalResult = Update-PlaylistResultAfterRetirement -Result $initialResult -RetiredCount 2 -DesiredCount 242 -MovieCount 74
 Assert-Equal 'final apply result counts watched items removed from the managed copy' $finalResult.RemovesFromCopy 5
@@ -146,9 +149,39 @@ $slotRepair = Replace-PlaylistMissingMovieSlots -Queue $slotQueue -MovieOrder $s
 Assert-Equal 'deleted filler replacement keeps the first queue position' $slotRepair.Queue[1].Identity 'slot-replacement-a'
 Assert-Equal 'deleted filler replacement keeps later queue position' $slotRepair.Queue[3].Identity 'slot-replacement-b'
 Assert-Equal 'movie order receives replacements in the matching slots' ($slotRepair.Movies.Identity -join ',') 'slot-replacement-a,slot-replacement-b'
+Assert-Equal 'slot repair leaves the saved queue untouched until its result is committed' $slotQueue[1].Identity 'slot-missing-a'
 $slotBad = $false
 try { Replace-PlaylistMissingMovieSlots -Queue $slotQueue -MovieOrder $slotMovies -MissingIdentities @('slot-missing-a','slot-missing-b') -Replacements @((Media 'slot-replacement-a'),(Media 'slot-replacement-a')) } catch { $slotBad = $true }
 Assert-True 'replacement refuses duplicate random selections' $slotBad
+$slotCurrent = @($slotQueue | Where-Object { $_.Identity -cne 'slot-missing-a' })
+$manualRemoved = @(Get-PlaylistManualMovieRemovals -Queue $slotQueue -Current $slotCurrent)
+Assert-Equal 'a movie manually removed from the managed playlist becomes a replacement slot' ($manualRemoved -join ',') 'slot-missing-a'
+$retiredNotReplaced = @(Get-PlaylistManualMovieRemovals -Queue $slotQueue -Current $slotCurrent -RetiredIdentities @('slot-missing-a'))
+Assert-Equal 'explicit watched retirement is not treated as a random replacement slot' $retiredNotReplaced.Count 0
+$replacementGroupMovies = @((Media 'replacement-franchise-1'),(Media 'replacement-franchise-2'))
+$replacementGroup = [pscustomobject]@{ Id='replacement-franchise'; Name='replacement franchise'; Kind='franchise'; Members=$replacementGroupMovies }
+$replacementAnchored = Media 'replacement-show-movie'
+$replacementWatched = Media 'replacement-watched'; $replacementWatched.Watched=$true
+$replacementDeleted = @((Media 'replacement-deleted-a'),(Media 'replacement-deleted-b'))
+$replacementPool = @(1..10 | ForEach-Object { Media ("replacement-random-$_") }) + $replacementGroupMovies + $replacementAnchored + $replacementWatched + $replacementDeleted
+$replacementTestPath = Join-Path ([IO.Path]::GetTempPath()) ('movie-replacement-test-' + [guid]::NewGuid().ToString('N') + '.mkv')
+[IO.File]::WriteAllText($replacementTestPath, 'test')
+foreach ($movie in $replacementPool) { $movie.Paths = @($replacementTestPath) }
+$replacementMovieOrder = @($replacementGroupMovies[0],(Media 'replacement-random-2'),(Media 'replacement-random-3'),$replacementDeleted[0],$replacementDeleted[1])
+try {
+    $plannedReplacements = @(Get-PlaylistMovieReplacements -Movies $replacementPool -Groups @($replacementGroup) -MovieOrder $replacementMovieOrder -MissingIdentities @($replacementDeleted.Identity) -ReservedIdentities @($replacementAnchored.Identity) -Seed 42)
+    $repeatReplacements = @(Get-PlaylistMovieReplacements -Movies $replacementPool -Groups @($replacementGroup) -MovieOrder $replacementMovieOrder -MissingIdentities @($replacementDeleted.Identity) -ReservedIdentities @($replacementAnchored.Identity) -Seed 42)
+}
+finally { Remove-Item -LiteralPath $replacementTestPath -Force }
+Assert-Equal 'removed movie slots receive the requested number of random replacements' $plannedReplacements.Count 2
+Assert-Equal 'random movie replacement plan is deterministic for the saved seed' ($plannedReplacements.Identity -join ',') ($repeatReplacements.Identity -join ',')
+Assert-Equal 'replacement follows queued franchise installments and their two-movie spacing' $plannedReplacements[0].Identity 'replacement-franchise-2'
+Assert-Equal 'removed movie identities are not selected again' @($plannedReplacements | Where-Object Identity -in $replacementDeleted.Identity).Count 0
+Assert-Equal 'replacement selection excludes show-linked movies reserved for anchors' @($plannedReplacements | Where-Object Identity -eq $replacementAnchored.Identity).Count 0
+Assert-Equal 'replacement selection excludes watched movies' @($plannedReplacements | Where-Object Identity -eq $replacementWatched.Identity).Count 0
+Assert-Equal 'replacement selection does not duplicate movies already in the saved order' @($plannedReplacements | Where-Object Identity -in @('replacement-random-2','replacement-random-3')).Count 0
+$replacementWriteBlock = Get-SourceBetween -Script 'playlist-manager.ps1' -Start 'if ($manualMovieRemovalIds.Count -and -not $unresolved.Count)' -End '$status = @{}'
+Assert-True 'manager applies group- and show-rule-aware replacements to manually removed movie slots' ($replacementWriteBlock -match 'Get-PlaylistMovieReplacements' -and $replacementWriteBlock -match 'Replace-PlaylistMissingMovieSlots' -and $replacementWriteBlock -match 'MovieOrder')
 
 $resumeQueue = @($episodes | Where-Object { $_.ShowKey -notin @($shows[0..13].Key) })
 $resumeQueue += @(1..2 | ForEach-Object { Media ('new-resume-' + $_) 'episode' $_ $standby.Key })
@@ -328,6 +361,21 @@ Assert-Equal 'already synchronized playlist is idempotent' $same.Count 0
 $bad = $false
 try { Get-PlaylistSyncOperations -Desired @($movies[0],$movies[0]) -Current @() } catch { $bad = $true }
 Assert-True 'duplicate desired entries are refused' $bad
+$guardQueue = @(1..243 | ForEach-Object {
+    $type = if ($_ -in @(61,108,231)) { 'movie' } else { 'episode' }
+    Media ("guard-item-$_") $type $_ 'guard-show'
+})
+Assert-True 'complete saved queue passes the preservation guard' (Assert-PlaylistBaseQueuePreserved -BaseQueue $guardQueue -Desired $guardQueue)
+foreach ($position in @(61,108,231)) {
+    $missingGuardItem = $false
+    $proposalWithHole = @($guardQueue | Where-Object Identity -CNE $guardQueue[$position - 1].Identity)
+    try { [void](Assert-PlaylistBaseQueuePreserved -BaseQueue $guardQueue -Desired $proposalWithHole) } catch { $missingGuardItem = $_.Exception.Message -match 'omitted or reordered' }
+    Assert-True "saved movie at position $position cannot be omitted from a proposal" $missingGuardItem
+}
+$reorderedGuardQueue = @($guardQueue[1],$guardQueue[0]) + @($guardQueue | Select-Object -Skip 2)
+$bad = $false
+try { [void](Assert-PlaylistBaseQueuePreserved -BaseQueue $guardQueue -Desired $reorderedGuardQueue) } catch { $bad = $_.Exception.Message -match 'omitted or reordered' }
+Assert-True 'saved item reordering is rejected by the preservation guard' $bad
 
 $script:PlaylistBase = 'http://127.0.0.1:1'
 $script:SourcePlaylistId = '1'; $script:ManagedPlaylistId = '2'; $script:PlaylistApply = $true
@@ -426,6 +474,14 @@ $bad = $false
 try { Set-PlaylistIntendedItems -Desired $movies[0..2] -Current $script:FakeItems } catch { $bad = $_.Exception.Message -match 'absent|Verification' }
 Assert-True 'server silently ignoring additions is a failure, not success' $bad
 $script:IgnoreAdds = $false
+
+$script:FakeLibrary = $guardQueue
+$script:FakeItems = @($guardQueue | Where-Object Identity -notin @($guardQueue[60].Identity,$guardQueue[107].Identity,$guardQueue[230].Identity))
+[void](Set-PlaylistIntendedItems -Desired $guardQueue -Current $script:FakeItems)
+Assert-Equal 'sync restores all three missing entries without leaving playlist holes' ($script:FakeItems.Identity -join ',') ($guardQueue.Identity -join ',')
+foreach ($position in @(61,108,231)) {
+    Assert-Equal "sync restores the missing movie at position $position" $script:FakeItems[$position - 1].Identity $guardQueue[$position - 1].Identity
+}
 
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('playlist-test-' + [guid]::NewGuid().ToString('N'))
 try {

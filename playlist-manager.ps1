@@ -287,6 +287,11 @@ try {
     elseif ($state -and -not $RecoverOnly -and (Test-Path -LiteralPath $statePath)) {
         throw 'An interrupted update has pending intent. Run -Apply -RecoverOnly before extending it.'
     }
+    $manualMovieRemovalIds = @()
+    if ($state) {
+        $retiredMovieIds = @($retirements + $recoveredRetirements | ForEach-Object { $_.Item.Identity })
+        $manualMovieRemovalIds = @(Get-PlaylistManualMovieRemovals -Queue @($state.Queue) -Current $current -RetiredIdentities $retiredMovieIds)
+    }
     if ($Apply) {
         $backup = [pscustomobject]@{ At = (Get-Date).ToString('o'); SourceId = $script:SourcePlaylistId; TargetId = $script:ManagedPlaylistId; Source = $original; Target = $current }
         Write-PlaylistJson -Path (Join-Path $script:PlaylistData 'before-latest-apply.json') -Value $backup
@@ -305,6 +310,7 @@ try {
     $refreshedSections = @{}
     if ($state) {
         foreach ($wanted in @($state.Queue)) {
+            if ($wanted.Identity -in $manualMovieRemovalIds) { continue }
             $found = Resolve-PlaylistMedia $wanted $library
             if ((-not $found -or ($found -and -not (Test-PlaylistMediaPresent $found))) -and $Apply) {
                 $sectionId = [string]$wanted.SectionId
@@ -318,25 +324,8 @@ try {
             }
             if ($found) { $recovered += $found }
             else {
-                $knownGroupMember = @($state.Groups | Where-Object { @($_.Members | ForEach-Object Identity) -contains $wanted.Identity }).Count -gt 0
-                $sourceVolumeReady = $false
-                if (@($wanted.Paths).Count -eq 1) {
-                    try { $sourceVolumeReady = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($wanted.Paths[0])).IsReady } catch { $sourceVolumeReady = $false }
-                }
-                $deletedStandaloneMovie = $Apply -and $state.Applied -and $wanted.Type -eq 'movie' -and
-                    $wanted.Identity -notin $current.Identity -and -not $knownGroupMember -and $sourceVolumeReady -and
-                    $refreshedSections[[string]$wanted.SectionId]
-                if ($deletedStandaloneMovie) {
-                    $removedMovie = Remove-PlaylistMovieSlot -Queue @($state.Queue) -MovieOrder @($state.Movies) -Identity $wanted.Identity
-                    $state.Queue = @($removedMovie.Queue)
-                    $state.BaseQueue = @($state.BaseQueue | Where-Object Identity -CNE $wanted.Identity)
-                    $state.Movies = @($removedMovie.Movies)
-                    Add-PlaylistAlert ('deleted-managed-movie-' + $wanted.Identity) ("Plex no longer lists '$($wanted.Title)'; removed its managed-queue slot without selecting a replacement movie. No media file was changed.")
-                }
-                else {
-                    $unresolved += $wanted
-                    Add-PlaylistAlert ('unresolved-' + $wanted.Identity) ("Missing/ambiguous item: $($wanted.Show) $($wanted.Title). Expected: $($wanted.Paths -join ', '). Check disks/library. No playlist write until recovery is complete.")
-                }
+                $unresolved += $wanted
+                Add-PlaylistAlert ('unresolved-' + $wanted.Identity) ("Missing/ambiguous item: $($wanted.Show) $($wanted.Title). Expected: $($wanted.Paths -join ', '). Check disks/library. Its saved queue slot is retained; no playlist write until recovery is complete.")
             }
         }
     }
@@ -344,6 +333,17 @@ try {
     $episodes = @($library | Where-Object Type -eq 'episode')
     $movies = @($library | Where-Object Type -eq 'movie')
     $showMovieAnchors = @(Get-PlaylistShowMovieAnchors -Shows $shows -Episodes $episodes -Movies $movies -ShowMovieLinks @($script:PlaylistCfg.showMovieLinks))
+    $reservedShowMovieIds = @($showMovieAnchors | ForEach-Object MovieIdentity)
+    $groups = @(Get-PlaylistMovieGroups -Movies @($movies | Where-Object Identity -notin $reservedShowMovieIds) -ThematicGroups @($script:PlaylistCfg.thematicGroups))
+    if ($manualMovieRemovalIds.Count -and -not $unresolved.Count) {
+        $replacements = @(Get-PlaylistMovieReplacements -Movies $movies -Groups $groups -MovieOrder @($state.Movies) -MissingIdentities $manualMovieRemovalIds -ReservedIdentities $reservedShowMovieIds -Seed ([int]$script:PlaylistCfg.randomSeed))
+        $queueRepair = Replace-PlaylistMissingMovieSlots -Queue @($state.Queue) -MovieOrder @($state.Movies) -MissingIdentities $manualMovieRemovalIds -Replacements $replacements
+        $baseRepair = Replace-PlaylistMissingMovieSlots -Queue @($state.BaseQueue) -MovieOrder @($state.BaseQueue | Where-Object Type -eq 'movie') -MissingIdentities $manualMovieRemovalIds -Replacements $replacements
+        $state.Queue = @($queueRepair.Queue)
+        $state.BaseQueue = @($baseRepair.Queue)
+        $state.Movies = @($queueRepair.Movies)
+        Add-PlaylistAlert 'manual-movie-replacements' ("Replaced $($manualMovieRemovalIds.Count) manually removed movie slot(s) with random movies selected using franchise ordering and show-linked movie reservations.")
+    }
     if ($state -and $showMovieAnchors.Count) {
         $oldQueueOrder = @($state.Queue | ForEach-Object Identity)
         $state.Queue = @(Set-PlaylistAnchoredMovieQueue -Queue @($state.Queue) -Anchors $showMovieAnchors)
@@ -399,14 +399,12 @@ try {
     $newRounds = [pscustomobject]@{ Rounds = @(); ActiveIds = $activeIds; Cursors = $cursors; Replacements = @(); Stop = @(); CycleConsumed = $cycleConsumed; NextCycleNumber = $cycleNumber }
     $moviePlan = [pscustomobject]@{ Movies = $existingMovies; Stop = '' }
     [object[]]$roundMovieAnchors = @()
-    [object[]]$groups = @(); if ($state) { $groups = @($state.Groups) }
+    if ($state -and -not $groups.Count) { $groups = @($state.Groups) }
     if (-not $RecoverOnly -and -not $unresolved.Count) {
         $newRounds = Get-PlaylistRounds -Shows $shows -Episodes $episodes -Original $original -Replacements @($script:PlaylistCfg.replacements) -TvStatus $status -Cursors $cursors -ActiveIds $activeIds -StartRound $cycleNumber -CycleConsumed $cycleConsumed
         foreach ($reason in $newRounds.Stop) { Add-PlaylistAlert ('round-shortage-' + $reason.Split(':')[0]) $reason }
         foreach ($change in $newRounds.Replacements) { Add-PlaylistAlert ('replacement-' + $change.From) ("Round $($change.Round): $($change.From) replaced by $($change.To). Manual override: $($change.ManualOverride).") }
         $rounds += @($newRounds.Rounds)
-        $reservedShowMovieIds = @($showMovieAnchors | ForEach-Object MovieIdentity)
-        $groups = @(Get-PlaylistMovieGroups -Movies @($movies | Where-Object Identity -notin $reservedShowMovieIds) -ThematicGroups @($script:PlaylistCfg.thematicGroups))
         # Keep the user's existing random movie choices as the initial draw order.
         # They are preferences, NOT permission to append the whole copied tail.
         $baseMovieCount = @($state.BaseQueue | Where-Object Type -eq 'movie').Count
@@ -446,6 +444,9 @@ try {
         else { if ($wanted.Identity -notin $unresolved.Identity) { $unresolved += $wanted }; $resolvedDesired += $wanted }
     }
     $desired = $resolvedDesired
+    if ($state) {
+        [void](Assert-PlaylistBaseQueuePreserved -BaseQueue @($state.BaseQueue) -Desired $desired)
+    }
     foreach ($gap in @(Get-PlaylistCadenceGaps -Queue $current -EpisodesPerMovie ([int]$script:PlaylistCfg.episodesPerMovie))) {
         $key = 'cadence-gap-live-' + $gap.PreviousMovie.Identity + '-' + $gap.NextMovie.Identity
         Add-PlaylistAlert $key ("Managed live playlist cadence gap: {0} TV episodes between movie #{1} '{2}' and movie #{3} '{4}' (expected {5}). Review the managed order; no source-playlist or media changes were made." -f $gap.EpisodeCount,$gap.PreviousPosition,$gap.PreviousMovie.Title,$gap.NextPosition,$gap.NextMovie.Title,[int]$script:PlaylistCfg.episodesPerMovie)
