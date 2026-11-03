@@ -2,12 +2,43 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_helpers.ps1')
 . (Join-Path $script:TestRoot 'playlist-lib.ps1')
 
+$managerSource = [IO.File]::ReadAllText((Join-Path $script:TestRoot 'playlist-manager.ps1'))
+Assert-False 'manual managed-playlist edits do not block manager applies' ($managerSource -match 'Manual playlist edits detected|AcceptManualOrder')
+$initialResult = [pscustomobject]@{ DesiredCount=244; RemovesFromCopy=3; Movies=75 }
+$finalResult = Update-PlaylistResultAfterRetirement -Result $initialResult -RetiredCount 2 -DesiredCount 242 -MovieCount 74
+Assert-Equal 'final apply result counts watched items removed from the managed copy' $finalResult.RemovesFromCopy 5
+Assert-Equal 'final apply result count matches the post-retirement queue' $finalResult.DesiredCount 242
+Assert-Equal 'final apply result records how many watched items were retired' $finalResult.RetiredWatchedItems 2
+Assert-Equal 'final apply result movie count reflects the remaining movie order' $finalResult.Movies 74
+
 function Media {
     param([string]$Id, [string]$Type = 'movie', [int]$Episode = 0, [string]$ShowKey = '')
     [pscustomobject]@{ Identity = $Id; Ids = @('plex://' + $Id); Key = $Id; Type = $Type; Title = $Id
         Watched = $false; Season = 1; Episode = $Episode; ShowKey = $ShowKey; SortTitle = $Id
-        Show = $ShowKey; ReleaseDate = ('2000-01-{0:00}' -f ([math]::Max(1,$Episode))); Paths = @(); Collections = @(); PlaylistItemId = 'p-' + $Id }
+        Show = $ShowKey; ReleaseDate = ('2000-01-{0:00}' -f ([math]::Max(1,$Episode))); AddedAt = 0; Paths = @(); Collections = @(); PlaylistItemId = 'p-' + $Id }
 }
+$sourceBeforeRetirement = @((Media 'source-retired'),(Media 'source-keep-1'),(Media 'source-keep-2'))
+$sourceAfterRetirement = @($sourceBeforeRetirement | Where-Object Identity -ne 'source-retired')
+Assert-Equal 'source guard accepts only Plex pruning a completed retirement' (Test-PlaylistSourceMatchesAfterRetirements $sourceBeforeRetirement $sourceAfterRetirement @('source-retired')) $true
+Assert-Equal 'source guard rejects an unrelated removal' (Test-PlaylistSourceMatchesAfterRetirements $sourceBeforeRetirement @($sourceAfterRetirement | Select-Object -Skip 1) @('source-retired')) $false
+Assert-Equal 'source guard rejects a reorder during retirement' (Test-PlaylistSourceMatchesAfterRetirements $sourceBeforeRetirement @($sourceAfterRetirement[1],$sourceAfterRetirement[0]) @('source-retired')) $false
+$missingRetirementPath = Join-Path ([IO.Path]::GetTempPath()) ('retirement-recovery-test-' + [guid]::NewGuid().ToString('N') + '.mkv')
+$pendingRetirement = [pscustomobject]@{ Status='Pending'; Deleted=$false; QueueUpdated=$false; Path=$missingRetirementPath }
+Assert-Equal 'pending retirement is recoverable only for an absent file on a ready managed volume' (Test-PlaylistPendingRetirementFileMissing $pendingRetirement @([IO.Path]::GetTempPath())) $true
+Assert-Equal 'pending retirement outside configured roots is not auto-recovered' (Test-PlaylistPendingRetirementFileMissing $pendingRetirement @($env:SystemRoot)) $false
+ $accentedSeriesRoot = 'H:\S' + [char]0x00e9 + 'ries'
+ $accentedSeriesPath = $accentedSeriesRoot + '\Show\episode.mkv'
+ Assert-Equal 'Unicode media paths match their UTF-8 configured root' (Test-PlaylistPathUnderRoots $accentedSeriesPath @($accentedSeriesRoot)) $true
+ Assert-Equal 'Unicode media paths do not match a similarly named unconfigured root' (Test-PlaylistPathUnderRoots $accentedSeriesPath @('H:\Series')) $false
+[IO.File]::WriteAllText($missingRetirementPath, 'test')
+try {
+    Assert-Equal 'existing pending-retirement file is never treated as deleted' (Test-PlaylistPendingRetirementFileMissing $pendingRetirement @([IO.Path]::GetTempPath())) $false
+    [IO.File]::SetAttributes($missingRetirementPath, ([IO.File]::GetAttributes($missingRetirementPath) -bor [IO.FileAttributes]::ReadOnly))
+    $retirementRemoval = Remove-PlaylistRetirementFile -Path $missingRetirementPath
+    Assert-Equal 'authorized retirement clears ReadOnly only to delete the file' $retirementRemoval.ReadOnlyCleared $true
+    Assert-Equal 'retirement helper removes a ReadOnly file' ([IO.File]::Exists($missingRetirementPath)) $false
+}
+finally { [IO.File]::Delete($missingRetirementPath) }
 $savedToken=$env:TMDB_READ_TOKEN; $savedKey=$env:TMDB_API_KEY
 try {
     $env:TMDB_READ_TOKEN='stale-environment-token'; $env:TMDB_API_KEY='stale-environment-key'
@@ -21,6 +52,46 @@ try {
 }
 finally { $env:TMDB_READ_TOKEN=$savedToken; $env:TMDB_API_KEY=$savedKey }
 $shows = @(1..25 | ForEach-Object { $s = Media ('show{0:00}' -f $_) 'show'; $s })
+$simpsons = Media 'simpsons-show' 'show'; $simpsons.Title='The Simpsons'; $simpsons.Key='simpsons-key'; $simpsons.Identity='plex://show/simpsons'; $simpsons.Ids=@('tmdb://456')
+$simpsonsMovie = Media 'simpsons-movie'; $simpsonsMovie.Title='The Simpsons Movie'; $simpsonsMovie.ReleaseDate='2007-07-25'; $simpsonsMovie.Ids=@('tmdb://35')
+$simpsonsEpisodes = @(foreach($e in @(@(21,'2007-05-13'),@(22,'2007-05-20'),@(23,'2007-08-01'))){$x=Media ("simpsons-s18e$($e[0])") 'episode' $e[0] $simpsons.Key;$x.Season=18;$x.ReleaseDate=$e[1];$x})
+$simpsonsLinks = @([pscustomobject]@{showTmdbId='456';movieTmdbIds=@('35')})
+$simpsonsAnchors = @(Get-PlaylistShowMovieAnchors -Shows @($simpsons) -Episodes $simpsonsEpisodes -Movies @($simpsonsMovie) -ShowMovieLinks $simpsonsLinks)
+Assert-Equal 'show movie anchors to the latest episode released before the film' $simpsonsAnchors[0].EpisodeIdentity 'simpsons-s18e22'
+$simpsonsMovie.Watched=$true
+Assert-Equal 'a watched show-associated movie cannot be reintroduced by a later anchor plan' @(Get-PlaylistShowMovieAnchors -Shows @($simpsons) -Episodes $simpsonsEpisodes -Movies @($simpsonsMovie) -ShowMovieLinks $simpsonsLinks).Count 0
+$simpsonsMovie.Watched=$false
+$unlinkedTitleMatch = @(Get-PlaylistShowMovieAnchors -Shows @($simpsons) -Episodes $simpsonsEpisodes -Movies @($simpsonsMovie))
+Assert-Equal 'show/movie title similarity alone does not create an association' $unlinkedTitleMatch.Count 0
+$simpsonsRounds = @([pscustomobject]@{Episodes=$simpsonsEpisodes})
+$simpsonsCadence = Get-PlaylistCadencePlan -Rounds $simpsonsRounds -EpisodeOffset 2 -EpisodesPerMovie 5 -Anchors $simpsonsAnchors
+Assert-Equal 'anchored film replaces a random cadence slot and resets the offset' $simpsonsCadence.RegularMovieSlots 0
+$randomForAnchor = Media 'random-film'; $anchoredPlan = Get-PlaylistMovies -Movies @($randomForAnchor,$simpsonsMovie) -Groups @() -Slots 1 -Seed 4 -ReservedIdentities @($simpsonsMovie.Identity)
+Assert-Equal 'show-associated movie is excluded from random selection' $anchoredPlan.Movies[0].Identity 'random-film'
+$anchoredQueue = @(Merge-PlaylistQueue -Rounds $simpsonsRounds -Movies @($randomForAnchor,$simpsonsMovie) -EpisodeOffset 2 -MovieAnchors $simpsonsAnchors)
+Assert-Equal 'show movie is queued immediately after the triggering episode' $anchoredQueue[2].Identity $simpsonsMovie.Identity
+$southPark = Media 'south-park-show' 'show'; $southPark.Title='South Park'; $southPark.Key='south-park-key'; $southPark.Identity='plex://show/south-park'; $southPark.Ids=@('tmdb://2190')
+$southParkMovie = Media 'south-park-post-covid'; $southParkMovie.Title='South Park: Post Covid'; $southParkMovie.ReleaseDate='2021-11-25'; $southParkMovie.Ids=@('tmdb://874299')
+$southParkEpisodes = @((Media 'south-park-s24e02' 'episode' 2 $southPark.Key),(Media 'south-park-s25e01' 'episode' 1 $southPark.Key))
+$southParkEpisodes[0].Season=24; $southParkEpisodes[0].ReleaseDate='2021-03-10'
+$southParkEpisodes[1].Season=25; $southParkEpisodes[1].ReleaseDate='2022-02-02'
+$southParkAnchor = @(Get-PlaylistShowMovieAnchors -Shows @($southPark) -Episodes $southParkEpisodes -Movies @($southParkMovie) -ShowMovieLinks @([pscustomobject]@{showTmdbId='2190';movieTmdbIds=@('874299')}))
+Assert-Equal 'colon-title movie is anchored to the last prior South Park episode' $southParkAnchor[0].EpisodeIdentity 'south-park-s24e02'
+$parks = Media 'parks-show' 'show'; $parks.Title='Parks and Recreation'; $parks.Key='parks-key'; $parks.Identity='plex://show/parks'; $parks.Ids=@('tmdb://8592')
+$parksMovie = Media 'parks-special'; $parksMovie.Title='A Parks and Recreation Special'; $parksMovie.ReleaseDate='2020-04-30'; $parksMovie.Ids=@('tmdb://696507')
+$parksEpisodes = @((Media 'parks-s7e12' 'episode' 12 $parks.Key),(Media 'parks-s7e13' 'episode' 13 $parks.Key))
+foreach($e in $parksEpisodes){$e.Season=7;$e.ReleaseDate='2015-02-24'}
+$parksAnchor = @(Get-PlaylistShowMovieAnchors -Shows @($parks) -Episodes $parksEpisodes -Movies @($parksMovie) -ShowMovieLinks @([pscustomobject]@{showTmdbId='8592';movieTmdbIds=@('696507')}))
+Assert-Equal 'leading article in movie title still matches the exact Parks and Recreation title' $parksAnchor[0].EpisodeIdentity 'parks-s7e13'
+$cadenceInput = @((Media 'cadence-deleted')) + @(1..3 | ForEach-Object { Media ("cadence-e$_") 'episode' $_ 'show01' }) + @((Media 'cadence-next')) + @(4..5 | ForEach-Object { Media ("cadence-e$_") 'episode' $_ 'show01' })
+$deletedFirstMovie = Remove-PlaylistMovieSlot -Queue $cadenceInput -MovieOrder @($cadenceInput | Where-Object Type -eq 'movie') -Identity 'cadence-deleted'
+Assert-Equal 'a manually deleted movie slot is dropped without replacement' @($deletedFirstMovie.Queue | Where-Object Identity -eq 'cadence-deleted').Count 0
+Assert-Equal 'deleting the head movie preserves three remaining episodes before the next movie' $deletedFirstMovie.Queue[3].Identity 'cadence-next'
+$cadenceCorrectionInput = @(1..10 | ForEach-Object { Media ("move-e$_") 'episode' $_ 'show01' }) + @((Media 'move-first'),(Media 'move-second'),(Media 'move-tail'))
+$movieMovedForCorrection = @(Set-PlaylistMovieCadenceOffset -Queue $cadenceCorrectionInput -EpisodeOffset 3 -EpisodesPerMovie 5)
+Assert-Equal 'cadence correction puts the next movie after the earned three episodes' $movieMovedForCorrection[3].Identity 'move-first'
+Assert-Equal 'following movie resumes after five more episodes' $movieMovedForCorrection[9].Identity 'move-second'
+Assert-Equal 'cadence correction preserves TV order' ((@($movieMovedForCorrection | Where-Object Type -eq 'episode').Identity) -join ',') 'move-e1,move-e2,move-e3,move-e4,move-e5,move-e6,move-e7,move-e8,move-e9,move-e10'
 $episodes = @(foreach ($s in $shows) { foreach ($n in 3,1,2) { Media ($s.Key + '-' + $n) 'episode' $n $s.Key } })
 $plan = Get-PlaylistRounds -Shows $shows -Episodes $episodes -Original @() -Replacements @() -TvStatus @{}
 Assert-Equal 'exactly 25 shows form three complete rounds' @($plan.Rounds).Count 3
@@ -45,17 +116,30 @@ Assert-Equal 'new round is alphabetized after replacement' $swapped.Rounds[1].Ep
 Assert-Equal 'manual override is recorded' $swapped.Replacements[0].ManualOverride $true
 $blocked = Get-PlaylistRounds -Shows $shows -Episodes $short -Original @() -Replacements @() -TvStatus @{}
 Assert-Equal 'one exhausted show stops further complete rounds' @($blocked.Rounds).Count 1
-Assert-True 'exhausted continuing/unknown show is not silently retired' ($blocked.Stop[0] -match 'show01')
+Assert-True 'cycle stop identifies the first exhausted show in rotation order' ($blocked.Stop[0] -match 'stopped after 0 of 25 show slots; blocked: show01: no eligible next episode and no downloaded standby is ready')
 $knownEnd = @{}
 $knownEnd[$shows[0].Identity] = [pscustomobject]@{ Known=$true; Ended=$true; Final=10001; Missing=@(); NextAirDate='' }
 $noDownloadedStandby = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes @($short | Where-Object ShowKey -ne $standby.Key) -Original @() -Replacements @() -TvStatus $knownEnd -ActiveIds @($shows.Identity)
 Assert-Equal 'downloadable but not locally downloaded standby cannot replace an exhausted show' @($noDownloadedStandby.Replacements).Count 0
-Assert-True 'cycle remains stopped without a downloaded replacement episode' ($noDownloadedStandby.Stop -match 'show01')
+Assert-True 'cycle remains stopped at the exhausted show without a downloaded replacement' ($noDownloadedStandby.Stop -match 'blocked: show01: no downloadable episodes remain; cycle stops here')
 $auto = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes $short -Original @() -Replacements @() -TvStatus $knownEnd -ActiveIds @($shows.Identity)
 Assert-Equal 'confirmed exhaustion uses an available downloaded standby' $auto.Replacements[0].To 'show26'
 Assert-False 'metadata-driven replacement is not labeled a manual override' $auto.Replacements[0].ManualOverride
 Assert-True 'replacement joins the rotation in alphabetical order' ($auto.Rounds[1].Episodes[-1].ShowKey -eq 'show26')
-
+$unknownStandby = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes $short -Original @() -Replacements @() -TvStatus @{} -ActiveIds @($shows.Identity)
+Assert-Equal 'Plex-downloaded standby substitutes when the exhausted active show has unknown provider status' $unknownStandby.Replacements[0].To 'show26'
+Assert-Equal 'unknown-status substitution preserves the active roster size' @($unknownStandby.ActiveIds).Count 25
+$newerStandby = Media 'show27' 'show'; $newerStandby.AddedAt = 200
+$standby.AddedAt = 100
+$newShowEpisodes = @($short) + @(Media 'newer-episode' 'episode' 1 $newerStandby.Key)
+$newShowEpisodes[-1].Season = 9
+$newShowStatus = @{}
+$newShowStatus[$shows[0].Identity] = [pscustomobject]@{ Known=$true; Ended=$true; Final=10003; Missing=@([pscustomobject]@{Number=10002}); NextAirDate='' }
+$newShowStatus[$newerStandby.Identity] = [pscustomobject]@{ Known=$true; Ended=$false; Final=0; Missing=@([pscustomobject]@{Number=10001}); Future=@(); NextAirDate='' }
+$newShowPlan = Get-PlaylistRounds -Shows ($shows + $standby + $newerStandby) -Episodes $newShowEpisodes -Original @() -Replacements @() -TvStatus $newShowStatus -ActiveIds @($shows.Identity)
+Assert-Equal 'newest downloaded show replaces an ended active show despite stale historical gaps' $newShowPlan.Replacements[0].To 'show27'
+Assert-True 'new show starts at its first downloaded unwatched episode' (@($newShowPlan.Rounds[1].Episodes | Where-Object Identity -eq 'newer-episode').Count -eq 1)
+Assert-Equal 'replacement keeps the active roster at 25 shows' @($newShowPlan.ActiveIds).Count 25
 $slotQueue = @((Media 'slot-episode-1' 'episode' 1 'show01'), (Media 'slot-missing-a'), (Media 'slot-episode-2' 'episode' 2 'show02'), (Media 'slot-missing-b'))
 $slotMovies = @($slotQueue | Where-Object Type -eq 'movie')
 $slotRepair = Replace-PlaylistMissingMovieSlots -Queue $slotQueue -MovieOrder $slotMovies -MissingIdentities @('slot-missing-a','slot-missing-b') -Replacements @((Media 'slot-replacement-a'),(Media 'slot-replacement-b'))
@@ -153,23 +237,25 @@ Assert-Equal 'available partial cycle is kept without inventing a fifth slot' $p
 
 $middleShort = @($episodes | Where-Object { $_.ShowKey -ne 'show14' -or $_.Episode -eq 1 })
 $untilGap = Get-PlaylistRounds -Shows $shows -Episodes $middleShort -Original @() -Replacements @() -TvStatus @{}
-Assert-Equal 'missing show fourteen retains the preceding thirteen episodes' @($untilGap.Rounds[1].Episodes).Count 13
-Assert-Equal 'queue stops immediately before the missing show' $untilGap.Rounds[1].Episodes[-1].ShowKey 'show13'
-Assert-Equal 'partial cycle records thirteen consumed show positions' @($untilGap.CycleConsumed).Count 13
+Assert-Equal 'future cycle keeps the eligible ordered prefix before its blocker' @($untilGap.Rounds).Count 2
+Assert-Equal 'partial future cycle keeps the first thirteen eligible shows' @($untilGap.Rounds[1].Episodes).Count 13
+Assert-Equal 'partial cycle stops immediately before the unavailable fourteenth show' $untilGap.Rounds[1].Episodes[-1].ShowKey 'show13'
+Assert-True 'cycle stop names the first blocked show and reason' ($untilGap.Stop[0] -match 'stopped after 13 of 25 show slots; blocked: show14: no eligible next episode and no downloaded standby is ready')
+Assert-Equal 'partial-cycle prefix is persisted for exact resumption' @($untilGap.CycleConsumed).Count 13
 Assert-Equal 'partial cycle is resumed with the same cycle number' $untilGap.NextCycleNumber 2
 $blockedAgain = Get-PlaylistRounds -Shows $shows -Episodes $middleShort -Original @() -Replacements @() -TvStatus @{} -Cursors $untilGap.Cursors -ActiveIds $untilGap.ActiveIds -CycleConsumed $untilGap.CycleConsumed -StartRound $untilGap.NextCycleNumber
 Assert-Equal 'retry cannot skip the missing show to start another cycle' @($blockedAgain.Rounds).Count 0
 $updated = $middleShort + (Media 'new-show14-2' 'episode' 2 'show14')
 $resume = Get-PlaylistRounds -Shows $shows -Episodes $updated -Original @() -Replacements @() -TvStatus @{} -Cursors $untilGap.Cursors -ActiveIds $untilGap.ActiveIds -CycleConsumed $untilGap.CycleConsumed -StartRound $untilGap.NextCycleNumber
-Assert-Equal 'downloaded content resumes exactly at the blocked show' $resume.Rounds[0].Episodes[0].ShowKey 'show14'
-Assert-Equal 'resume completes only the twelve remaining cycle positions' @($resume.Rounds[0].Episodes).Count 12
+Assert-Equal 'downloaded content resumes at the blocked show' $resume.Rounds[0].Episodes[0].ShowKey 'show14'
+Assert-Equal 'resume completes the twelve remaining rotation positions' @($resume.Rounds[0].Episodes).Count 12
 $gapMovies = (Get-PlaylistMovies -Movies $movies -Groups @() -Slots 7 -Seed 42).Movies
 $gapQueue = @(Merge-PlaylistQueue -Rounds $untilGap.Rounds -Movies $gapMovies)
-Assert-Equal '38 queued episodes get seven movies, not ten' @($gapQueue|Where-Object Type -eq 'movie').Count 7
+Assert-Equal '38 queued TV episodes receive seven earned movie slots' @($gapQueue|Where-Object Type -eq 'movie').Count 7
 Assert-Equal 'three trailing episodes carry cadence across retry' (Get-PlaylistEpisodeOffset $gapQueue) 3
 $resumeMovies = @($gapMovies) + @($movies | Where-Object { $_.Identity -notin $gapMovies.Identity } | Select-Object -First 3)
 $resumedQueue = @(Merge-PlaylistContinuation -BaseQueue $gapQueue -Rounds @($resume.Rounds[0]) -Movies $resumeMovies)
-Assert-Equal 'next movie follows two resumed episodes, completing the old five' $resumedQueue[$gapQueue.Count+2].Type 'movie'
+Assert-Equal 'next movie follows two resumed episodes that finish the pending five' $resumedQueue[$gapQueue.Count+2].Type 'movie'
 
 # The existing queue is the viewing continuation point, NOT a request to rebuild
 # a round from alphabetic position one. Even watched/partial historical entries
@@ -215,6 +301,25 @@ $wanted = Media 'old'; $found = Media 'new'; $found.Ids = $wanted.Ids
 Assert-Equal 'stable identity resolves a changed ratingKey' (Resolve-PlaylistMedia $wanted @($found)).Key 'new'
 Assert-Equal 'missing library media stays unresolved' (Resolve-PlaylistMedia $wanted @()) $null
 Assert-Equal 'ambiguous identity does not pick an arbitrary edition' (Resolve-PlaylistMedia $wanted @($found,$wanted)) $null
+$validProbe = Test-PlaylistMediaProbeJson '{"media":{"track":[{"@type":"General","FileSize":"1024"},{"@type":"Video","Format":"AVC"}]}}' 1024
+Assert-True 'integrity probe accepts a readable video track with matching size' $validProbe.Healthy
+$headerOnlyProbe = Test-PlaylistMediaProbeJson '{"media":{"track":[{"@type":"General","FileSize":"8"}]}}' 8
+Assert-False 'integrity probe flags a container with no video stream' $headerOnlyProbe.Healthy
+$sizeProbe = Test-PlaylistMediaProbeJson '{"media":{"track":[{"@type":"General","FileSize":"8"},{"@type":"Video"}]}}' 16
+Assert-True 'integrity probe explains a reported-size mismatch' ($sizeProbe.Reason -match 'possible truncation')
+$invalidProbe = Test-PlaylistMediaProbeJson 'not-json' 8
+Assert-False 'integrity probe flags unreadable metadata output' $invalidProbe.Healthy
+$cadenceQueue = @((Media 'cadence-movie-a')) + @(1..4 | ForEach-Object { Media ("cadence-episode-$_") 'episode' $_ 'show01' }) + @((Media 'cadence-movie-b'),(Media 'cadence-after-b' 'episode' 5 'show01'))
+$cadenceGaps = @(Get-PlaylistCadenceGaps -Queue $cadenceQueue -EpisodesPerMovie 5)
+Assert-Equal 'four-episode movie interval is detected as cadence gap' $cadenceGaps.Count 1
+Assert-Equal 'cadence gap identifies the following movie' $cadenceGaps[0].NextMovie.Identity 'cadence-movie-b'
+Assert-Equal 'cadence gap reports one-based position of the preceding movie' $cadenceGaps[0].PreviousPosition 1
+Assert-Equal 'cadence gap reports one-based position of the following movie' $cadenceGaps[0].NextPosition 6
+$tailQueue = $cadenceQueue + @((Media 'reserve-movie-a'),(Media 'reserve-movie-b'))
+Assert-Equal 'movie-only reserve tail does not create false cadence gaps' @(Get-PlaylistCadenceGaps -Queue $tailQueue -EpisodesPerMovie 5).Count 1
+$fullCadence = @((Media 'full-movie-a')) + @(1..5 | ForEach-Object { Media ("full-episode-$_") 'episode' $_ 'show01' }) + @((Media 'full-movie-b'),(Media 'full-after-b' 'episode' 6 'show01'))
+$fullCadenceGaps = @(Get-PlaylistCadenceGaps -Queue $fullCadence -EpisodesPerMovie 5)
+Assert-Equal 'five-episode movie interval is accepted' $fullCadenceGaps.Count 0
 $ops = @(Get-PlaylistSyncOperations -Desired $movies[0..2] -Current @($movies[0],$movies[3]))
 Assert-Equal 'sync adds only missing items' @($ops|Where-Object Kind -eq 'add').Count 2
 Assert-Equal 'sync removes unwanted references, not files' @($ops|Where-Object Kind -eq 'remove').Count 1

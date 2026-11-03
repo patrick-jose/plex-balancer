@@ -6,14 +6,18 @@ param(
     [string]$DataDirectory,
     [switch]$Apply,
     [switch]$RecoverOnly,
-    [switch]$AcceptManualOrder,
-    [string]$RepairCycleStopBeforeShow
+    [Alias('RetireOneWatchedHead','RetireOneWatchedEpisode')][switch]$RetireOneWatchedItem,
+    [switch]$RetireWatchedItems,
+    [string]$RepairCycleStopBeforeShow,
+    [int]$MovieCadenceEpisodeOffset = -1
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'playlist-lib.ps1')
 if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'playlist.config.json' }
 if (-not (Test-Path -LiteralPath $ConfigPath)) { throw 'Create playlist.config.json from playlist.config.example.json first.' }
 $script:PlaylistCfg = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json
+$script:WatchedRetirementWindow = [int](Get-PlaylistProp $script:PlaylistCfg 'watchedRetirementWindow' 5)
+if ($script:WatchedRetirementWindow -lt 1) { throw 'watchedRetirementWindow must be a positive queue-position count.' }
 $script:PlaylistBase = ([string]$script:PlaylistCfg.serverUrl).TrimEnd('/')
 $serverUri = [uri]$script:PlaylistBase
 if ($serverUri.Scheme -notin @('http','https') -or $serverUri.UserInfo -or $serverUri.Query) { throw 'Invalid Plex server URL.' }
@@ -26,6 +30,11 @@ $script:PlaylistHeaders = @{ 'X-Plex-Token' = $token; Accept = 'application/xml'
 $script:PlaylistApply = [bool]$Apply
 $script:PlaylistAlerts = @{}
 $script:PlaylistData = if ($DataDirectory) { [IO.Path]::GetFullPath($DataDirectory) } else { Join-Path $PSScriptRoot 'playlist-data' }
+if ($RetireOneWatchedItem -and (-not $Apply -or -not $RecoverOnly)) { throw '-RetireOneWatchedItem requires both -Apply and -RecoverOnly.' }
+if ($RetireOneWatchedItem -and -not (Get-PlaylistProp $script:PlaylistCfg 'watchedFileDeletion' $false)) { throw '-RetireOneWatchedItem requires watchedFileDeletion=true in playlist.config.json.' }
+if ($RetireWatchedItems -and (-not $Apply -or -not $RecoverOnly)) { throw '-RetireWatchedItems requires both -Apply and -RecoverOnly.' }
+if ($RetireWatchedItems -and -not (Get-PlaylistProp $script:PlaylistCfg 'watchedFileDeletion' $false)) { throw '-RetireWatchedItems requires watchedFileDeletion=true in playlist.config.json.' }
+if ($RetireWatchedItems -and $RetireOneWatchedItem) { throw 'Choose either -RetireWatchedItems or -RetireOneWatchedItem, not both.' }
 [void][IO.Directory]::CreateDirectory($script:PlaylistData)
 $statePath = Join-Path $script:PlaylistData 'state.json'
 $mutex = [Threading.Mutex]::new($false, 'Global\PlexBalancer')
@@ -71,33 +80,40 @@ try {
     }
 
     function Invoke-AutomaticRetirement {
-        param([object[]]$Desired, $State, [string]$StatePath, [string]$DataDirectory)
+        param([object[]]$Desired, $State, [string]$StatePath, [string]$DataDirectory, [int]$WatchedWindow = 5, [switch]$RetryExistingOnly, [switch]$SingleHeadOnly)
         $mainCfg = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'config.json')) | ConvertFrom-Json
         $removed = 0
+        # Freeze eligibility to the initial bounded window. Removing an item
+        # must not pull queue positions beyond the window into this same run.
+        $eligibleRetirementIds = @(Get-PlaylistWatchedQueueItems -Queue $Desired -WindowSize $WatchedWindow | ForEach-Object Identity)
         while ($true) {
             if ($Desired.Count -eq 0) { break }
-            $head = Get-PlaylistWatchedQueueHead $Desired
-            if (-not $head) { break }  # never skip past an unwatched/non-episode head
-            if (@($head.Paths).Count -ne 1) { Write-Warning "Head episode has multiple/unknown paths, skipping retirement"; break }
-            $path = [IO.Path]::GetFullPath($head.Paths[0])
-            $rootMatches = @($mainCfg.libraries.roots | ForEach-Object { $_ } | Where-Object { $path.StartsWith($_.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase) })
-            if (-not $rootMatches.Count -or -not [IO.File]::Exists($path)) { Write-Warning "Head episode file missing, skipping retirement"; break }
-            if (([IO.FileInfo]::new($path).Attributes -band [IO.FileAttributes]::ReparsePoint)) { Write-Warning "Head episode is a reparse point, skipping retirement"; break }
+            $head = @($Desired | Where-Object { $_.Identity -in $eligibleRetirementIds -and $_.Type -in @('episode','movie') -and $_.Watched } | Select-Object -First 1)
+            if (-not $head.Count) { break }
+            $head = $head[0]
+            $transactionPath = Join-Path $DataDirectory ('retirement-' + $head.Key + '.json')
+            if ($RetryExistingOnly -and -not (Test-Path -LiteralPath $transactionPath)) { break }
+            if (@($head.Paths).Count -ne 1) { Write-Warning "Watched item has multiple/unknown paths, skipping retirement"; break }
+        $path = [IO.Path]::GetFullPath($head.Paths[0])
+        $retirementRoots = @($mainCfg.libraries | ForEach-Object { $_.roots })
+            if (-not (Test-PlaylistPathUnderRoots -Path $path -Roots $retirementRoots) -or -not [IO.File]::Exists($path)) { Write-Warning "Watched item file missing or outside managed roots, skipping retirement"; break }
+            if (([IO.FileInfo]::new($path).Attributes -band [IO.FileAttributes]::ReparsePoint)) { Write-Warning "Watched item is a reparse point, skipping retirement"; break }
+            if ($head.Type -eq 'movie' -and @($State.Movies | Where-Object Identity -CEQ $head.Identity).Count -ne 1) { throw "Watched movie $($head.Identity) is not present exactly once in saved movie order; no media deleted." }
             $bytes = ([IO.FileInfo]::new($path)).Length
             # Verify the managed queue still has the exact intended order before
-            # any destructive action; this is a queue-head retirement only.
+            # any destructive action; the watched item must still be queued.
             $remaining = @(Read-ManagedItems $script:ManagedPlaylistId)
-            if (($remaining.Identity -join '|') -cne ($Desired.Identity -join '|')) { throw 'Managed playlist changed before watched-head retirement; no media deleted.' }
+        if (($remaining.Identity -join '|') -cne ($Desired.Identity -join '|')) { throw 'Managed playlist changed before watched-episode retirement; no media deleted.' }
             $sessions = Invoke-PlaylistPlex '/status/sessions'
             foreach ($video in $sessions.SelectNodes('Video')) {
                 if ($video.GetAttribute('ratingKey') -eq $head.Key -or $video.GetAttribute('guid') -in $head.Ids) {
-                    Write-Host "Stopping session $($video.GetAttribute('sessionId')) playing head episode..."
+                    Write-Host "Stopping session $($video.GetAttribute('sessionId')) playing watched item..."
                     [void](Invoke-PlaylistPlex "/status/sessions/$($video.GetAttribute('sessionId'))" 'Delete')
                 }
                 else {
                     foreach ($part in $video.SelectNodes('Media/Part')) {
                         if ($part.GetAttribute('file') -eq $path) {
-                            Write-Host "Stopping session $($video.GetAttribute('sessionId')) using head episode file..."
+                            Write-Host "Stopping session $($video.GetAttribute('sessionId')) using watched item file..."
                             [void](Invoke-PlaylistPlex "/status/sessions/$($video.GetAttribute('sessionId'))" 'Delete')
                         }
                     }
@@ -110,31 +126,42 @@ try {
                 if ($video.GetAttribute('ratingKey') -eq $head.Key -or $video.GetAttribute('guid') -in $head.Ids) { $stillPlaying = $true }
                 foreach ($part in $video.SelectNodes('Media/Part')) { if ($part.GetAttribute('file') -eq $path) { $stillPlaying = $true } }
             }
-            if ($stillPlaying) { Write-Warning 'Watched head is still in an active Plex session; skipping retirement'; break }
+            if ($stillPlaying) { Write-Warning 'Watched item is still in an active Plex session; skipping retirement'; break }
 
-            $transactionPath = Join-Path $DataDirectory ('retirement-' + $head.Key + '.json')
-            if (Test-Path -LiteralPath $transactionPath) { throw "Retirement transaction already exists for $($head.Key); inspect before retrying." }
-            $transaction = [pscustomobject]@{ At=(Get-Date).ToString('o'); Item=$head; Path=$path; Bytes=$bytes
-                Reason='Automatic retirement: watched managed-playlist head; no active session; torrent check omitted by user policy'
-                Status='Pending'; Deleted=$false; QueueUpdated=$false }
-            Write-PlaylistJson (Join-Path $DataDirectory ('before-retirement-'+$head.Key+'.json')) $State
-            Write-PlaylistJson $transactionPath $transaction
-            # Delete file with exclusive handle + DeleteOnClose
+            if (Test-Path -LiteralPath $transactionPath) {
+                $transaction = [IO.File]::ReadAllText($transactionPath) | ConvertFrom-Json
+                if ($transaction.Status -ne 'Pending' -or $transaction.Deleted -or $transaction.QueueUpdated -or
+                    $transaction.Item.Identity -cne $head.Identity -or [IO.Path]::GetFullPath([string]$transaction.Path) -cne $path) {
+                    throw "Retirement transaction already exists for $($head.Key) with different or unsafe state; inspect before retrying."
+                }
+                if (-not $transaction.Bytes) { $transaction.Bytes = $bytes }
+            }
+            else {
+                $transaction = [pscustomobject]@{ At=(Get-Date).ToString('o'); Item=$head; Path=$path; Bytes=$bytes
+                    Reason='Automatic retirement: Plex-watched managed-playlist item; no active session; torrent check omitted by user policy'
+                    Status='Pending'; Deleted=$false; QueueUpdated=$false }
+                Write-PlaylistJson (Join-Path $DataDirectory ('before-retirement-'+$head.Key+'.json')) $State
+                Write-PlaylistJson $transactionPath $transaction
+            }
             try {
-                $handle = [IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None,4096,[IO.FileOptions]::DeleteOnClose)
-                $handle.Dispose()
-                if ([IO.File]::Exists($path)) { throw 'File still exists after DeleteOnClose; transaction retained for inspection.' }
+                [void](Remove-PlaylistRetirementFile -Path $path)
             }
             catch {
-                throw ("Watched-head retirement failed for " + $path + ": " + $_.Exception.Message + "; transaction retained for inspection.")
+                throw ("Watched-item retirement failed for " + $path + ": " + $_.Exception.Message + "; transaction retained for inspection.")
             }
             $transaction.Deleted = $true; $transaction.Status = 'FileDeleted'
             Write-PlaylistJson $transactionPath $transaction
-            Write-Host "Auto-retired watched head: $($head.Show) S$($head.Season)E$($head.Episode) - $($head.Title) ($([math]::Round($bytes/1GB,2)) GB)"
+            $itemLabel = if ($head.Type -eq 'movie') { $head.Title } else { "$($head.Show) S$($head.Season)E$($head.Episode) - $($head.Title)" }
+            Write-Host "Auto-retired watched item: $itemLabel ($([math]::Round($bytes/1GB,2)) GB)"
             $removed++
             # Persist the tombstone before repairing the playlist so an
             # interrupted update cannot reintroduce media that was deleted.
-            $Desired = @($Desired | Select-Object -Skip 1)
+            if ($head.Type -eq 'movie') {
+                $movieRemoval = Remove-PlaylistMovieSlot -Queue $Desired -MovieOrder @($State.Movies) -Identity $head.Identity
+                $Desired = @($movieRemoval.Queue)
+                $State.Movies = @($movieRemoval.Movies)
+            }
+            else { $Desired = @($Desired | Where-Object { $_.Identity -cne $head.Identity }) }
             $State.Queue = $Desired
             $State.BaseQueue = @($State.BaseQueue | Where-Object Identity -ne $head.Identity)
             $State | Add-Member -NotePropertyName Retired -NotePropertyValue (@(Get-PlaylistProp $State 'Retired' @()) + $transaction) -Force
@@ -146,8 +173,10 @@ try {
             Write-PlaylistJson $StatePath $State
             $transaction.QueueUpdated=$true; $transaction.Status='Complete'
             Write-PlaylistJson $transactionPath $transaction
+            if ($RetryExistingOnly -or $SingleHeadOnly) { break }
         }
-        if ($removed -gt 0) { Write-Host "Auto-retired $removed watched head episode(s)." }
+        if ($removed -gt 0) { Write-Host "Auto-retired $removed watched item(s)." }
+        return $removed
     }
 
     $playlists = @(Get-PlaylistPlexItems '/playlists' 'Playlist')
@@ -177,6 +206,14 @@ try {
     elseif (-not $RecoverOnly) {
         $state = New-PlaylistContinuationState -Queue $current -Shows $shows -Replacements @($script:PlaylistCfg.replacements) -Server $script:PlaylistBase -SourceId $script:SourcePlaylistId -TargetId $script:ManagedPlaylistId
     }
+    # Preserve the persisted order snapshot for the manual-edit guard. Planner
+    # repairs later in this run must not be mistaken for user edits to Plex.
+    if ($MovieCadenceEpisodeOffset -ge 0) {
+        if (-not $Apply -or -not $state -or -not $state.Applied) { throw 'Correcting movie cadence requires an applied state and -Apply.' }
+        $state.Queue = @(Set-PlaylistMovieCadenceOffset -Queue @($state.Queue) -EpisodeOffset $MovieCadenceEpisodeOffset -EpisodesPerMovie ([int]$script:PlaylistCfg.episodesPerMovie))
+        $state.BaseQueue = @(Set-PlaylistMovieCadenceOffset -Queue @($state.BaseQueue) -EpisodeOffset $MovieCadenceEpisodeOffset -EpisodesPerMovie ([int]$script:PlaylistCfg.episodesPerMovie))
+        Add-PlaylistAlert 'movie-cadence-resume-correction' "Restored the existing cadence offset: the first movie follows $MovieCadenceEpisodeOffset queued episodes, then movie slots resume every $([int]$script:PlaylistCfg.episodesPerMovie) episodes."
+    }
     if ($RepairCycleStopBeforeShow) {
         if (-not $Apply -or -not $RecoverOnly -or -not $state) { throw 'Cycle-stop repair requires an initialized state and both -RecoverOnly and -Apply.' }
         $repair = Repair-PlaylistQueueBeforeBlockedShow -Queue @($state.BaseQueue) -Shows $shows -ActiveIds @($state.ActiveIds) -StopShow $RepairCycleStopBeforeShow
@@ -189,21 +226,60 @@ try {
         Write-Host ("Repairing saved managed queue: stop before {0}; retained {1} items; Penn & Teller retained and episode-sorted." -f $RepairCycleStopBeforeShow, $repair.Queue.Count)
     }
     # Explicit watched retirement is a removal decision, not a recoverable gap.
-    # A partial transaction must be inspected rather than re-adding deleted media.
+    # A partial transaction is recoverable only when its recorded path is absent
+    # on a confirmed-ready managed volume. Never delete a file during recovery.
     $retirements = @()
+    $recoveredRetirements = @()
+    $retryPendingRetirement = $false
+    $retirementConfig = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'config.json')) | ConvertFrom-Json
+    $retirementRoots = @($retirementConfig.libraries | ForEach-Object { $_.roots })
     foreach ($file in @(Get-ChildItem -LiteralPath $script:PlaylistData -Filter 'retirement-*.json' -File)) {
         $record = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json
-        if ($record.Status -ne 'Complete') { throw "Watched retirement needs inspection: $($file.Name). Queue recovery paused to prevent resurrection." }
-        $retirements += $record
+        if ($record.Status -eq 'Complete') { $retirements += $record; continue }
+        $confirmedMissingRetirement = $false
+        $validPendingRetirementPath = $false
+        $pendingRetirementFileExists = $false
+        $fileDeletedTransaction = $record.Status -eq 'FileDeleted' -and $record.Deleted -and -not $record.QueueUpdated
+        $pendingTransaction = $record.Status -eq 'Pending' -and -not $record.Deleted -and -not $record.QueueUpdated
+        if (($pendingTransaction -or $fileDeletedTransaction) -and $record.Path) {
+            try {
+                $retirementPath = [IO.Path]::GetFullPath([string]$record.Path)
+                $validPendingRetirementPath = Test-PlaylistPathUnderRoots -Path $retirementPath -Roots $retirementRoots
+                if ($validPendingRetirementPath) {
+                    $retirementDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($retirementPath))
+                    $pendingRetirementFileExists = [IO.File]::Exists($retirementPath)
+                    $confirmedMissingRetirement = $retirementDrive.IsReady -and -not $pendingRetirementFileExists
+                }
+                $script:PlaylistRetirementRecoveryDiagnostic = "managedPath=$validPendingRetirementPath; ready=$($retirementDrive.IsReady); exists=$pendingRetirementFileExists"
+            }
+            catch { $script:PlaylistRetirementRecoveryDiagnostic = $_.Exception.Message }
+        }
+        if ([bool]$Apply -and $null -ne $state -and $confirmedMissingRetirement -and ($pendingTransaction -or $fileDeletedTransaction)) {
+            $record | Add-Member -NotePropertyName TransactionPath -NotePropertyValue $file.FullName -Force
+            $recoveredRetirements += $record
+            $recoveredLabel = if ($record.Item.Type -eq 'movie') { $record.Item.Title } else { "$($record.Item.Show) S$($record.Item.Season)E$($record.Item.Episode)" }
+            Write-Warning "Recovering watched retirement for ${recoveredLabel}: recorded file is absent on a ready volume; no file deletion will be attempted."
+            continue
+        }
+        if ([bool]$Apply -and $state -and (Get-PlaylistProp $script:PlaylistCfg 'watchedFileDeletion' $false) -and
+            $validPendingRetirementPath -and $pendingRetirementFileExists -and $record.Item.Watched -and
+            (Get-PlaylistWatchedQueueItem -Queue @($state.Queue) -WindowSize $script:WatchedRetirementWindow).Identity -ceq $record.Item.Identity -and
+            (Get-PlaylistWatchedQueueItem -Queue @($current) -WindowSize $script:WatchedRetirementWindow).Identity -ceq $record.Item.Identity) {
+            $retryLabel = if ($record.Item.Type -eq 'movie') { $record.Item.Title } else { "$($record.Item.Show) S$($record.Item.Season)E$($record.Item.Episode)" }
+            Write-Warning "Retrying existing watched retirement for $retryLabel; it remains the first watched item in the managed queue."
+            $retryPendingRetirement = $true
+            continue
+        }
+        throw "Watched retirement needs inspection: $($file.Name). Queue recovery paused to prevent resurrection. (apply=$([bool]$Apply); stateLoaded=$($null -ne $state); confirmedMissing=$confirmedMissingRetirement; check=$script:PlaylistRetirementRecoveryDiagnostic; status=$($record.Status); deleted=$($record.Deleted); queueUpdated=$($record.QueueUpdated); roots=$($retirementRoots.Count))"
     }
-    if ($state -and $retirements.Count) {
-        $retiredIds = @($retirements | ForEach-Object { $_.Item.Identity })
+    if ($state -and ($retirements.Count -or $recoveredRetirements.Count)) {
+        $retiredIds = @($retirements + $recoveredRetirements | ForEach-Object { $_.Item.Identity })
         $state.Queue = @($state.Queue | Where-Object { $_.Identity -notin $retiredIds })
         $state.BaseQueue = @($state.BaseQueue | Where-Object { $_.Identity -notin $retiredIds })
+        $state.Movies = @($state.Movies | Where-Object { $_.Identity -notin $retiredIds })
     }
     if ($state -and $state.Applied) {
-        # Existing relative order is fixed. New TV entries continue before the
-        # movie-only reserve, reusing its movies rather than appending past it.
+        # Retain saved order exactly; never reflow existing movie cycles.
         $state.BaseQueue = @($state.Queue)
         $state.Rounds = @()
         $state.Movies = @($state.Queue | Where-Object Type -eq 'movie')
@@ -226,7 +302,6 @@ try {
     # simply because a disk vanished, Plex lost a ratingKey, or a scan is delayed.
     $unresolved = @()
     $recovered = @()
-    $deletedMovieSlots = @()
     $refreshedSections = @{}
     if ($state) {
         foreach ($wanted in @($state.Queue)) {
@@ -252,8 +327,11 @@ try {
                     $wanted.Identity -notin $current.Identity -and -not $knownGroupMember -and $sourceVolumeReady -and
                     $refreshedSections[[string]$wanted.SectionId]
                 if ($deletedStandaloneMovie) {
-                    $deletedMovieSlots += $wanted
-                    Add-PlaylistAlert ('movie-filler-replacement-' + $wanted.Identity) ("Plex no longer lists deleted standalone movie '$($wanted.Title)', and its managed-playlist entry is gone. Its slot will receive a random standalone movie; franchise selections are unchanged.")
+                    $removedMovie = Remove-PlaylistMovieSlot -Queue @($state.Queue) -MovieOrder @($state.Movies) -Identity $wanted.Identity
+                    $state.Queue = @($removedMovie.Queue)
+                    $state.BaseQueue = @($state.BaseQueue | Where-Object Identity -CNE $wanted.Identity)
+                    $state.Movies = @($removedMovie.Movies)
+                    Add-PlaylistAlert ('deleted-managed-movie-' + $wanted.Identity) ("Plex no longer lists '$($wanted.Title)'; removed its managed-queue slot without selecting a replacement movie. No media file was changed.")
                 }
                 else {
                     $unresolved += $wanted
@@ -265,6 +343,16 @@ try {
 
     $episodes = @($library | Where-Object Type -eq 'episode')
     $movies = @($library | Where-Object Type -eq 'movie')
+    $showMovieAnchors = @(Get-PlaylistShowMovieAnchors -Shows $shows -Episodes $episodes -Movies $movies -ShowMovieLinks @($script:PlaylistCfg.showMovieLinks))
+    if ($state -and $showMovieAnchors.Count) {
+        $oldQueueOrder = @($state.Queue | ForEach-Object Identity)
+        $state.Queue = @(Set-PlaylistAnchoredMovieQueue -Queue @($state.Queue) -Anchors $showMovieAnchors)
+        $state.BaseQueue = @(Set-PlaylistAnchoredMovieQueue -Queue @($state.BaseQueue) -Anchors $showMovieAnchors)
+        $state.Movies = @($state.Queue | Where-Object Type -eq 'movie')
+        if (($oldQueueOrder -join '|') -cne (@($state.Queue | ForEach-Object Identity) -join '|')) {
+            Add-PlaylistAlert 'show-movie-anchor-correction' 'Moved show-associated movies out of random positions; each is reserved for the last show episode released before that movie.'
+        }
+    }
     $status = @{}
     # No title searches: provider IDs must match exactly. Only the show's remaining
     # timeline (at/after the manual seed) is relevant to missing-episode notices.
@@ -274,7 +362,15 @@ try {
             $anchor = if ($seed.Count) { [long]$seed[0].Season * 10000 + $seed[0].Episode } else { 1 }
             if ($state) {
                 $savedCursor = Get-PlaylistProp $state.Cursors $show.Identity 0
+                if (-not $seed.Count -and -not [long]$savedCursor) {
+                    $firstLocal = @($episodes | Where-Object { $_.ShowKey -eq $show.Key -and $_.Season -gt 0 -and -not $_.Watched } | Sort-Object Season, Episode | Select-Object -First 1)
+                    if ($firstLocal.Count) { $anchor = [long]$firstLocal[0].Season * 10000 + $firstLocal[0].Episode }
+                }
                 $anchor = [math]::Max($anchor, [long]$savedCursor + 1)
+            }
+            elseif (-not $seed.Count) {
+                $firstLocal = @($episodes | Where-Object { $_.ShowKey -eq $show.Key -and $_.Season -gt 0 -and -not $_.Watched } | Sort-Object Season, Episode | Select-Object -First 1)
+                if ($firstLocal.Count) { $anchor = [long]$firstLocal[0].Season * 10000 + $firstLocal[0].Episode }
             }
             $st = Get-PlaylistTvStatus $show $episodes $anchor
             $status[$show.Identity] = $st
@@ -302,49 +398,33 @@ try {
     $cycleNumber = [int](Get-PlaylistProp $state 'NextCycleNumber' 1)
     $newRounds = [pscustomobject]@{ Rounds = @(); ActiveIds = $activeIds; Cursors = $cursors; Replacements = @(); Stop = @(); CycleConsumed = $cycleConsumed; NextCycleNumber = $cycleNumber }
     $moviePlan = [pscustomobject]@{ Movies = $existingMovies; Stop = '' }
+    [object[]]$roundMovieAnchors = @()
     [object[]]$groups = @(); if ($state) { $groups = @($state.Groups) }
     if (-not $RecoverOnly -and -not $unresolved.Count) {
         $newRounds = Get-PlaylistRounds -Shows $shows -Episodes $episodes -Original $original -Replacements @($script:PlaylistCfg.replacements) -TvStatus $status -Cursors $cursors -ActiveIds $activeIds -StartRound $cycleNumber -CycleConsumed $cycleConsumed
         foreach ($reason in $newRounds.Stop) { Add-PlaylistAlert ('round-shortage-' + $reason.Split(':')[0]) $reason }
         foreach ($change in $newRounds.Replacements) { Add-PlaylistAlert ('replacement-' + $change.From) ("Round $($change.Round): $($change.From) replaced by $($change.To). Manual override: $($change.ManualOverride).") }
         $rounds += @($newRounds.Rounds)
-        $groups = @(Get-PlaylistMovieGroups -Movies $movies -ThematicGroups @($script:PlaylistCfg.thematicGroups))
-        if ($deletedMovieSlots.Count) {
-            $deletedIds = @($deletedMovieSlots | ForEach-Object Identity)
-            $groupedIds = @($groups | ForEach-Object { $_.Members } | ForEach-Object Identity)
-            $groupedIds += @($state.Groups | ForEach-Object { $_.Members } | ForEach-Object Identity)
-            $usedIds = @($state.Movies | Where-Object { $_.Identity -notin $deletedIds } | ForEach-Object Identity)
-            $standalonePool = @($movies | Where-Object { -not $_.Watched -and $_.Identity -notin $usedIds -and $_.Identity -notin $groupedIds })
-            $replacementPlan = Get-PlaylistMovies -Movies $standalonePool -Groups @() -Slots $deletedIds.Count -Seed ([int]$script:PlaylistCfg.randomSeed)
-            if (@($replacementPlan.Movies).Count -ne $deletedIds.Count) {
-                $unresolved += $deletedMovieSlots
-                $moviePlan.Stop = 'Not enough unwatched standalone movies to replace deleted filler slots; saved queue retained.'
-                Add-PlaylistAlert 'movie-filler-shortage' $moviePlan.Stop
-            }
-            else {
-                $repairedMovies = Replace-PlaylistMissingMovieSlots -Queue @($state.Queue) -MovieOrder @($state.Movies) -MissingIdentities $deletedIds -Replacements @($replacementPlan.Movies)
-                $state.Queue = @($repairedMovies.Queue)
-                $state.BaseQueue = @($repairedMovies.Queue)
-                $state.Movies = @($repairedMovies.Movies)
-                $existingMovies = @($state.Movies)
-                for ($i = 0; $i -lt $deletedMovieSlots.Count; $i++) {
-                    Add-PlaylistAlert ('movie-filler-replacement-' + $deletedIds[$i]) ("Replaced deleted filler '$($deletedMovieSlots[$i].Title)' with random standalone movie '$($replacementPlan.Movies[$i].Title)' in the same slot.")
-                }
-            }
-        }
+        $reservedShowMovieIds = @($showMovieAnchors | ForEach-Object MovieIdentity)
+        $groups = @(Get-PlaylistMovieGroups -Movies @($movies | Where-Object Identity -notin $reservedShowMovieIds) -ThematicGroups @($script:PlaylistCfg.thematicGroups))
         # Keep the user's existing random movie choices as the initial draw order.
         # They are preferences, NOT permission to append the whole copied tail.
         $baseMovieCount = @($state.BaseQueue | Where-Object Type -eq 'movie').Count
-        $episodeCount = @($rounds | ForEach-Object { $_.Episodes } | ForEach-Object { $_ }).Count
         $context = Get-PlaylistContinuationContext @($state.BaseQueue)
-        $newMovieSlots = [int][math]::Max(0, [math]::Floor(($context.Offset + $episodeCount) / 5) - @($context.Tail).Count)
-        $moviePlan = Get-PlaylistMovies -Movies $movies -Groups $groups -Slots ($baseMovieCount + $newMovieSlots) -Seed ([int]$script:PlaylistCfg.randomSeed) -Existing $existingMovies
+        $plannedEpisodeIds = @($newRounds.Rounds | ForEach-Object { $_.Episodes } | ForEach-Object Identity)
+        $roundMovieAnchors = @($showMovieAnchors | Where-Object { $_.EpisodeIdentity -in $plannedEpisodeIds })
+        $cadencePlan = Get-PlaylistCadencePlan -Rounds @($newRounds.Rounds) -EpisodeOffset $context.Offset -EpisodesPerMovie ([int]$script:PlaylistCfg.episodesPerMovie) -Anchors $roundMovieAnchors
+        $newMovieSlots = [int][math]::Max(0, $cadencePlan.RegularMovieSlots - @($context.Tail).Count)
+        $moviePlan = Get-PlaylistMovies -Movies $movies -Groups $groups -Slots ($baseMovieCount + $newMovieSlots) -Seed ([int]$script:PlaylistCfg.randomSeed) -Existing $existingMovies -ReservedIdentities $reservedShowMovieIds
+        foreach ($movieAnchor in $cadencePlan.TriggeredAnchors) {
+            if ($movieAnchor.MovieIdentity -notin @($moviePlan.Movies | ForEach-Object Identity)) { $moviePlan.Movies = @($moviePlan.Movies) + @($movieAnchor.Movie) }
+        }
         if ($moviePlan.Stop) { Add-PlaylistAlert 'movie-shortage' $moviePlan.Stop }
     }
     if ($RecoverOnly -and -not $state) { throw 'Recovery requires an initialized intended queue. Run a preview/initial apply first.' }
     $desired = @()
     if ($RecoverOnly -or $unresolved.Count) { if ($state) { $desired = @($state.Queue) } }
-    else { $desired = @(Merge-PlaylistContinuation -BaseQueue @($state.BaseQueue) -Rounds $rounds -Movies @($moviePlan.Movies)) }
+    else { $desired = @(Merge-PlaylistContinuation -BaseQueue @($state.BaseQueue) -Rounds $rounds -Movies @($moviePlan.Movies) -MovieAnchors @($roundMovieAnchors)) }
     # Resolve old round/movie records through stable IDs after any Plex section refresh.
     $resolvedDesired = @()
     foreach ($wanted in $desired) {
@@ -360,17 +440,81 @@ try {
         if ($found) {
             $resolvedDesired += $found
             if (-not (Test-PlaylistMediaPresent $found)) {
-                if ($found.Identity -notin $unresolved.Identity) { $unresolved += $found }
-                Add-PlaylistAlert ('file-unavailable-' + $found.Identity) ("Plex lists $($found.Title), but its file/drive is unavailable: $($found.Paths -join ', '). Playlist updates paused; no deletion or trash operation.")
+                Add-PlaylistAlert ('file-unavailable-' + $found.Identity) ("Plex still lists $($found.Title), so it remains in the managed queue. Its reported file path is not accessible to this process: $($found.Paths -join ', '). File probing is skipped; playlist membership follows Plex's library record.")
             }
         }
         else { if ($wanted.Identity -notin $unresolved.Identity) { $unresolved += $wanted }; $resolvedDesired += $wanted }
     }
     $desired = $resolvedDesired
+    foreach ($gap in @(Get-PlaylistCadenceGaps -Queue $current -EpisodesPerMovie ([int]$script:PlaylistCfg.episodesPerMovie))) {
+        $key = 'cadence-gap-live-' + $gap.PreviousMovie.Identity + '-' + $gap.NextMovie.Identity
+        Add-PlaylistAlert $key ("Managed live playlist cadence gap: {0} TV episodes between movie #{1} '{2}' and movie #{3} '{4}' (expected {5}). Review the managed order; no source-playlist or media changes were made." -f $gap.EpisodeCount,$gap.PreviousPosition,$gap.PreviousMovie.Title,$gap.NextPosition,$gap.NextMovie.Title,[int]$script:PlaylistCfg.episodesPerMovie)
+    }
+    foreach ($gap in @(Get-PlaylistCadenceGaps -Queue $desired -EpisodesPerMovie ([int]$script:PlaylistCfg.episodesPerMovie))) {
+        $key = 'cadence-gap-intended-' + $gap.PreviousMovie.Identity + '-' + $gap.NextMovie.Identity
+        Add-PlaylistAlert $key ("Managed intended playlist cadence gap: {0} TV episodes between movie #{1} '{2}' and movie #{3} '{4}' (expected {5}). Review the proposed order before applying." -f $gap.EpisodeCount,$gap.PreviousPosition,$gap.PreviousMovie.Title,$gap.NextPosition,$gap.NextMovie.Title,[int]$script:PlaylistCfg.episodesPerMovie)
+    }
+    $mediaIntegrityProbeCount = 0
+    $mediaIntegrityFailureCount = 0
+    if (Get-PlaylistProp $script:PlaylistCfg 'mediaIntegrityCheckEnabled' $false) {
+        $mediaInfoPath = [string](Get-PlaylistProp $script:PlaylistCfg 'mediaInfoPath' '')
+        if (-not $mediaInfoPath) {
+            $mediaInfoCommand = Get-Command MediaInfo.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($mediaInfoCommand) { $mediaInfoPath = $mediaInfoCommand.Source }
+        }
+        elseif (-not (Test-Path -LiteralPath $mediaInfoPath -PathType Leaf)) {
+            $mediaInfoCommand = Get-Command $mediaInfoPath -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($mediaInfoCommand) { $mediaInfoPath = $mediaInfoCommand.Source }
+        }
+        if (-not $mediaInfoPath -or -not (Test-Path -LiteralPath $mediaInfoPath -PathType Leaf)) {
+            Add-PlaylistAlert 'media-integrity-tool' 'Media integrity check skipped: configure mediaInfoPath or install MediaInfo.exe.'
+        }
+        else {
+            $probeCache = @{}
+            $probeCachePath = Join-Path $script:PlaylistData 'media-integrity-cache.json'
+            if (Test-Path -LiteralPath $probeCachePath) {
+                try {
+                    $savedProbeCache = Get-Content -LiteralPath $probeCachePath -Raw | ConvertFrom-Json
+                    foreach ($entry in $savedProbeCache.PSObject.Properties) { $probeCache[$entry.Name] = $entry.Value }
+                } catch { $probeCache = @{} }
+            }
+            $probeCacheDirty = $false
+            $countedProbePaths = @{}
+            foreach ($item in $desired) {
+                $partFailures = @()
+                foreach ($path in @($item.Paths)) {
+                    if (-not $path) { continue }
+                    if (-not [IO.File]::Exists($path)) { continue } # Missing files are reported by the recovery guard above.
+                    $fileInfo = [IO.FileInfo]::new($path)
+                    $cacheKey = $path.ToLowerInvariant()
+                    $cached = $probeCache[$cacheKey]
+                    if (-not $cached -or [long]$cached.Length -ne $fileInfo.Length -or [long]$cached.LastWriteTimeUtcTicks -ne $fileInfo.LastWriteTimeUtc.Ticks) {
+                        $probeCache[$cacheKey] = [pscustomobject]@{ Length=$fileInfo.Length; LastWriteTimeUtcTicks=$fileInfo.LastWriteTimeUtc.Ticks
+                            Result=(Test-PlaylistMediaPartIntegrity -Path $path -MediaInfoPath $mediaInfoPath) }
+                        $probeCacheDirty = $true
+                        $cached = $probeCache[$cacheKey]
+                    }
+                    $probe = $cached.Result
+                    if (-not $countedProbePaths.ContainsKey($cacheKey)) {
+                        $countedProbePaths[$cacheKey] = $true
+                        if ($probe.Available) {
+                            $mediaIntegrityProbeCount++
+                            if (-not $probe.Healthy) { $mediaIntegrityFailureCount++ }
+                        }
+                    }
+                    if ($probe.Available -and -not $probe.Healthy) { $partFailures += ("{0}: {1}" -f [IO.Path]::GetFileName($path),$probe.Reason) }
+                }
+                if ($partFailures.Count) {
+                    Add-PlaylistAlert ('media-integrity-' + $item.Identity) ("Possible damaged media for '$($item.Title)': $($partFailures -join '; '). Review or re-download the file; the manager will not modify it.")
+                }
+            }
+            if ($probeCacheDirty) { Write-PlaylistJson -Path $probeCachePath -Value $probeCache }
+        }
+    }
     $candidate = [pscustomobject]@{ Version = 2; At = (Get-Date).ToString('o'); Server = $script:PlaylistBase
         SourceId = $script:SourcePlaylistId; TargetId = $script:ManagedPlaylistId; Queue = $desired
         BaseQueue = @($state.BaseQueue)
-        Retired = $retirements
+        Retired = @($retirements + $recoveredRetirements)
         Rounds = $rounds; Movies = @($moviePlan.Movies); Groups = $groups
         Cursors = $newRounds.Cursors; ActiveIds = $newRounds.ActiveIds
         CycleConsumed = @($newRounds.CycleConsumed); NextCycleNumber = $newRounds.NextCycleNumber
@@ -379,7 +523,9 @@ try {
     $result = [pscustomobject]@{ At = (Get-Date).ToString('o'); Apply = [bool]$Apply; CurrentCount = $current.Count; DesiredCount = $desired.Count
         Rounds = $rounds.Count; AddedRounds = @($newRounds.Rounds).Count; AddedEpisodes = @($newRounds.Rounds | ForEach-Object { $_.Episodes } | ForEach-Object { $_ }).Count; Movies = @($moviePlan.Movies).Count
         Adds = @($ops | Where-Object Kind -eq 'add').Count; RemovesFromCopy = @($ops | Where-Object Kind -eq 'remove').Count
-        Unresolved = $unresolved.Count; Replacements = $newRounds.Replacements; Alerts = $script:PlaylistAlerts; Verified = $false }
+        Unresolved = $unresolved.Count; MediaProbeFiles = $mediaIntegrityProbeCount; MediaProbeFailures = $mediaIntegrityFailureCount
+        CycleStopReasons = @($newRounds.Stop)
+        Replacements = $newRounds.Replacements; Alerts = $script:PlaylistAlerts; Verified = $false }
     Write-PlaylistJson -Path (Join-Path $script:PlaylistData 'proposed-state.json') -Value $candidate
     Write-PlaylistJson -Path (Join-Path $script:PlaylistData 'last-result.json') -Value $result
 
@@ -398,16 +544,6 @@ try {
         if ($unresolved.Count) { throw 'Unresolved media remains. Notifications saved; existing playlist and intended state retained.' }
         if ($moviePlan.Stop) { throw 'Movie shortage prevents a valid complete queue; playlist unchanged.' }
         if (-not $desired.Count) { throw 'Refusing to clear a playlist with an empty proposal.' }
-        # If an established managed queue was deliberately edited or reordered,
-        # do not guess whether it was manual or a Plex failure. Missing-only cases
-        # are recoverable; novel extras/order changes require explicit acceptance.
-        if ($state -and $state.Applied -and -not $AcceptManualOrder) {
-            $knownQueue = @($state.Queue | ForEach-Object { $match = Resolve-PlaylistMedia $_ $library; if ($match) { $match } else { $_ } })
-            $extras = @($current | Where-Object { $_.Identity -notin $knownQueue.Identity })
-            $retained = @($current | Where-Object { $_.Identity -in $knownQueue.Identity } | ForEach-Object { $_.Identity })
-            $expectedRetained = @($knownQueue | Where-Object { $_.Identity -in $current.Identity } | ForEach-Object { $_.Identity })
-            if ($extras.Count -or ($retained -join '|') -cne ($expectedRetained -join '|')) { throw 'Manual playlist edits detected. Review the preview; rerun with -AcceptManualOrder only to explicitly restore the saved intended order.' }
-        }
         # Optimistic concurrency check before the first mutation.
         $fresh = @(Read-ManagedItems $script:ManagedPlaylistId)
         if (($fresh.Key -join ',') -cne ($current.Key -join ',')) { throw 'Managed playlist changed during planning; retry without overwriting concurrent edits.' }
@@ -415,13 +551,45 @@ try {
         Write-PlaylistJson $statePath $candidate
         [void](Set-PlaylistIntendedItems -Desired $desired -Current $current)
         $sourceNow = @(Read-ManagedItems $script:SourcePlaylistId)
-        if (($sourceNow.Key -join ',') -cne $originalSignature) { throw 'Original playlist changed concurrently; inspect before proceeding. This manager never writes to it.' }
+        if (($sourceNow.Key -join ',') -cne $originalSignature) {
+            $completedRetirementIds = @($retirements + $recoveredRetirements | ForEach-Object { $_.Item.Identity })
+            if (Test-PlaylistSourceMatchesAfterRetirements -Original $original -Current $sourceNow -RetiredIdentities $completedRetirementIds) {
+                Write-Warning 'Plex removed only completed watched-retirement items from the source playlist after their media deletion; no source-playlist write was made.'
+            }
+            else { throw 'Original playlist changed concurrently beyond Plex pruning completed retirements; inspect before proceeding. This manager never writes to it.' }
+        }
+        # Set-PlaylistIntendedItems has verified the final managed order. Refresh
+        # cadence notices from that verified queue so resolved gaps do not linger
+        # in the status screen as if they were still live.
+        foreach ($alertId in @($script:PlaylistAlerts.Keys | Where-Object { $_ -like 'cadence-gap-live-*' -or $_ -like 'cadence-gap-intended-*' })) {
+            $script:PlaylistAlerts.Remove($alertId)
+        }
+        foreach ($gap in @(Get-PlaylistCadenceGaps -Queue $desired -EpisodesPerMovie ([int]$script:PlaylistCfg.episodesPerMovie))) {
+            $key = 'cadence-gap-live-' + $gap.PreviousMovie.Identity + '-' + $gap.NextMovie.Identity
+            Add-PlaylistAlert $key ("Managed live playlist cadence gap: {0} TV episodes between movie #{1} '{2}' and movie #{3} '{4}' (expected {5}). Review the managed order; no source-playlist or media changes were made." -f $gap.EpisodeCount,$gap.PreviousPosition,$gap.PreviousMovie.Title,$gap.NextPosition,$gap.NextMovie.Title,[int]$script:PlaylistCfg.episodesPerMovie)
+        }
+        $result.Alerts = $script:PlaylistAlerts
+        Write-PlaylistJson -Path $alertPath -Value $script:PlaylistAlerts
         $candidate.Applied = $true; $result.Verified = $true
         Write-PlaylistJson $statePath $candidate
+        foreach ($transaction in $recoveredRetirements) {
+            $transaction.QueueUpdated = $true
+            $transaction.Status = 'Complete'
+            $transaction.PSObject.Properties.Remove('TransactionPath')
+            Write-PlaylistJson (Join-Path $script:PlaylistData ('retirement-' + $transaction.Item.Key + '.json')) $transaction
+        }
         Write-PlaylistJson -Path (Join-Path $script:PlaylistData 'last-result.json') -Value $result
     }
+    $retiredCount = 0
+    if ($Apply -and (Get-PlaylistProp $script:PlaylistCfg 'watchedFileDeletion' $false) -and (-not $RecoverOnly -or $retryPendingRetirement -or $RetireOneWatchedItem -or $RetireWatchedItems)) {
+        $retiredCount = Invoke-AutomaticRetirement -Desired $desired -State $candidate -StatePath $statePath -DataDirectory $script:PlaylistData -WatchedWindow $script:WatchedRetirementWindow -RetryExistingOnly:($RecoverOnly -and $retryPendingRetirement) -SingleHeadOnly:$RetireOneWatchedItem
+    }
+    $desired = @($candidate.Queue)
+    $result = Update-PlaylistResultAfterRetirement -Result $result -RetiredCount $retiredCount -DesiredCount $desired.Count -MovieCount @($candidate.Movies).Count
+    Write-PlaylistJson -Path (Join-Path $script:PlaylistData 'last-result.json') -Value $result
+
     $lines = @('# Managed playlist proposal', '', "Generated: $($result.At)", "Apply: $Apply; verified: $($result.Verified)",
-        "Current: $($current.Count); intended: $($desired.Count); newly planned cycle segments: $($rounds.Count); movies: $(@($moviePlan.Movies).Count)", '', '## Notifications')
+        "Current: $($current.Count); intended: $($desired.Count); newly planned cycle segments: $($rounds.Count); movies: $($result.Movies)", '', '## Notifications')
     foreach ($id in $script:PlaylistAlerts.Keys) { $lines += '- ' + $script:PlaylistAlerts[$id] }
     $lines += @('', '## Intended order')
     for ($i = 0; $i -lt $desired.Count; $i++) {
@@ -431,16 +599,10 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $script:PlaylistData 'queue.md'), ($lines -join "`r`n"), [Text.UTF8Encoding]::new($false))
     "Managed copy: $($script:PlaylistCfg.managedPlaylist); apply=$Apply; verified=$($result.Verified)"
-    "New episodes=$($result.AddedEpisodes), movies=$(@($moviePlan.Movies).Count), intended=$($desired.Count), add=$($result.Adds), remove from copy=$($result.RemovesFromCopy)"
+    "New episodes=$($result.AddedEpisodes), movies=$($result.Movies), intended=$($desired.Count), add=$($result.Adds), remove from copy=$($result.RemovesFromCopy)"
     "Reports and durable intent: $script:PlaylistData"
-
-    # Automatic retirement of watched episodes at the head of the playlist
-    if ($Apply -and -not $RecoverOnly -and (Get-PlaylistProp $script:PlaylistCfg 'watchedFileDeletion' $false)) {
-        Invoke-AutomaticRetirement -Desired $desired -State $candidate -StatePath $statePath -DataDirectory $script:PlaylistData
-    }
 }
 finally {
     if ($held) { try { $mutex.ReleaseMutex() } catch { } }
     $mutex.Dispose()
 }
-

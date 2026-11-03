@@ -4,12 +4,18 @@ $ErrorActionPreference='Stop'
 $head=[pscustomobject]@{Identity='head';Type='episode';Show='Spider-Noir';Season=1;Episode=4;Watched=$true;Paths=@('D:\TV\one.mkv')}
 $next=[pscustomobject]@{Identity='next';Type='episode';Show='Clone Wars';Season=2;Episode=6;Watched=$false;Paths=@('D:\TV\two.mkv')}
 $state=[pscustomobject]@{Queue=@($head,$next);BaseQueue=@($head,$next)}
-$automaticHead=Get-PlaylistWatchedQueueHead @($head,$next)
-Assert-Equal 'automatic retirement selects only the watched queue head' $automaticHead.Identity 'head'
-$automaticHead=Get-PlaylistWatchedQueueHead @($next,$head)
-Assert-Equal 'automatic retirement never skips an unwatched head' $automaticHead $null
-$movie=[pscustomobject]@{Identity='movie';Type='movie';Watched=$true}
-Assert-Equal 'automatic retirement never removes a movie head' (Get-PlaylistWatchedQueueHead @($movie,$head)) $null
+$automaticItem=Get-PlaylistWatchedQueueItem @($head,$next)
+Assert-Equal 'automatic retirement selects a watched episode' $automaticItem.Identity 'head'
+$automaticItem=Get-PlaylistWatchedQueueItem @($next,$head)
+Assert-Equal 'automatic retirement finds watched episodes after unwatched entries' $automaticItem.Identity 'head'
+$movie=[pscustomobject]@{Identity='movie';Type='movie';Watched=$false}
+Assert-Equal 'automatic retirement skips an unwatched movie and selects a watched episode after it' (Get-PlaylistWatchedQueueItem @($movie,$head)).Identity 'head'
+$movie.Watched=$true
+Assert-Equal 'automatic retirement selects a watched movie without replacing its slot' (Get-PlaylistWatchedQueueItem @($movie,$head)).Identity 'movie'
+Assert-Equal 'automatic retirement does nothing when no watched episode exists' (Get-PlaylistWatchedQueueItem @($next)) $null
+$outsideWindow=@(1..5|ForEach-Object{$x=[pscustomobject]@{Identity="unwatched-$_";Type='episode';Watched=$false};$x})+@($head)
+Assert-Equal 'watched items beyond the first five positions wait for a later run' @(Get-PlaylistWatchedQueueItems -Queue $outsideWindow -WindowSize 5).Count 0
+Assert-Equal 'a watched item becomes eligible when it enters the configured window' (Get-PlaylistWatchedQueueItem -Queue $outsideWindow -WindowSize 6).Identity 'head'
 $candidate=Get-PlaylistRetirementCandidate @($head,$next) $state 'Spider-Noir' 1 4 $true
 Assert-Equal 'only the explicitly confirmed watched head is selected' $candidate.Identity 'head'
 $bad=$false;try{Get-PlaylistRetirementCandidate @($head,$next) $state 'Spider-Noir' 1 4 $false}catch{$bad=$true}

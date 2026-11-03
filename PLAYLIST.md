@@ -2,14 +2,16 @@
 
 ## Critical continuation rule (user correction)
 
-LATEST STOP RULE: 25 is the rotation size, NOT an all-or-nothing admission gate.
-Add available next episodes in order and stop EXACTLY at the first show without
-its next episode/replacement. Keep the partial cycle already added. Add one movie
-per five newly queued TV episodes, not five movies for every attempted cycle.
-Persist which shows have contributed to the partial cycle and the trailing
-episode/movie phase, so a retry resumes at the missing show rather than starting
-the alphabet over or skipping past it. Preserve existing RELATIVE order, not a
-rule that new episodes must be appended after the entire movie-only tail.
+LATEST STOP RULE: 25 is the size of the active roster, not a gate requiring 25
+eligible episodes before any new cycle work can be queued. Continue in alphabetical
+rotation order from the saved consumed prefix. Queue each next downloaded, unwatched
+episode; when an outgoing show is finished, substitute an eligible downloaded show
+and continue in the same cycle. Keep the roster at 25. Stop immediately before the
+first show that has neither an eligible next episode nor a ready replacement; save
+the prefix and resume at that exact slot when content or a substitution becomes
+available. Do not skip ahead or discard eligible work from earlier slots. Add one
+movie per five newly queued TV episodes, preserving the trailing cadence and the
+existing relative order/insertion point rather than appending after the movie reserve.
 
 The manual queue is an EXISTING VIEWING POSITION, not a template to rebuild from
 the alphabetically first show. Preserve every imported item's order, including a
@@ -47,9 +49,14 @@ This feature is separate from drive balancing. `playlist-manager.ps1` previews
 by default and maintains only the configured managed copy with `-Apply`. It never
 changes the original playlist or watch state. Media deletion is controlled by
 `watchedFileDeletion` in the private playlist config; it is enabled by default.
-A successful apply retires consecutive Plex-watched episode files at the managed
-queue head; it never skips an unwatched/non-episode head. Set the option to `false`
-to disable file retirement while keeping playlist organization enabled.
+A successful apply scans only the first `watchedRetirementWindow` entries (default
+5) for Plex-watched episodes or movies, even when unwatched entries precede them.
+It removes watched items within that initial window, preserves the relative order
+of all remaining entries, and does not replace a retired movie with a random
+film. Eligibility is frozen at run start, so removing an item does not expand the
+window and sweep later positions in the same run. Items beyond it wait until a
+later run moves them into the window. Set `watchedFileDeletion` to `false` to
+disable file retirement while keeping playlist organization enabled.
 
 An explicit, narrowly scoped watched retirement is now available separately:
 
@@ -67,6 +74,14 @@ close qBittorrent. This exception does not change storage-balancing or recycle-b
 torrent protections. A durable retirement transaction is saved before permanent deletion;
 state and BaseQueue then exclude the item without reordering the remaining queue.
 Recovery honors completed retirement records and pauses for incomplete ones.
+Pending transactions are retried only when the same watched item is still within
+the configured window and its exact file remains under a configured library root;
+an absent file is reconciled only on a confirmed-ready volume. Retirement reads
+the root config as UTF-8 so accented paths compare consistently. For an authorized
+retirement, a ReadOnly attribute is cleared only for the exclusive DeleteOnClose
+attempt and restored if deletion fails. A recovery-only retry is bounded to its
+pending transaction; normal configured applies continue through eligible watched
+episodes and movies in the initial window while preserving all other queue order.
 Old snapshot restoration refuses to overwrite intentional retirements.
 
 The user explicitly confirmed Spider-Noir S01E04 was finished while Clone Wars
@@ -143,6 +158,12 @@ rules, reports and handoff context are therefore available in this project.
    can occupy its slot in the next cycle without rewriting already queued items.
 - Ordinary movie selection is random, without duplicates. Do not queue the entire
   movie library simply because it is available.
+- Show/movie associations use explicit TMDb IDs in `showMovieLinks`, not title
+  similarity. Keep linked movies out of random selection. With release dates,
+  anchor each movie after that show's latest episode released before the movie;
+  place it immediately after that episode when it enters the queue and restart
+  the five-episode cadence there. Unknown or ambiguous ID/date matches are not
+  guessed.
 - Selecting a member of a related group brings in the group's available entries,
   ordered by installment for story franchises and by release date for documentary
   groups such as Louis Theroux. Separate related entries by two unrelated movies.
@@ -221,18 +242,37 @@ TMDb requires an API credential. Local authentication and live metadata checks
 have now succeeded using the private configuration. Never embed credentials in
 source, reports, logs or committed config. Use Test-Tmdb.ps1 for uncached validation.
 
+## Media integrity notifications
+
+MediaInfo probing is disabled by default and is not part of routine playlist
+reconciliation. When explicitly enabled with `mediaIntegrityCheckEnabled`, the
+manager probes reachable files in the proposed managed queue. It warns when the
+container cannot be parsed, no video track is reported, or the reported file size
+differs from disk. Results are cached by path, size, and modification time. Alerts
+never delete or modify media; missing files remain under Plex refresh/recheck.
+
+## TV/movie cadence notifications
+
+Check movie boundaries through the last queued TV episode and report intervals
+with four TV episodes where five are expected. Exclude the trailing movie-only
+reserve/franchise tail so reserve movies do not create false alarms.
+
 ## Missing playlist items and recovery
 
-The manager must retain a durable intended queue, not treat Plex's current
-playlist as its only source of truth. Drive-to-drive moves, disconnected disks,
-disk errors and Plex rescans can remove playlist entries or recreate an item with
-a different Plex ratingKey. Persist stable identities, intended positions and
-relevant move history locally without storing credentials.
+Plex's library catalog is authoritative for indexed media and eligibility; durable
+state preserves intended viewing order, cursors and queue positions. Do not use a
+local file check to overrule an item that Plex still lists. Drive-to-drive moves,
+disconnected disks, disk errors and Plex rescans can remove playlist entries or
+recreate an item with a different Plex ratingKey. Persist stable identities and
+intended positions locally without storing credentials.
 
 - Compare the intended queue with Patrick Automated. Detect missing entries,
   preserving their positions and the remaining TV/movie/group ordering.
 - If the item is still in Plex, restore its playlist reference at the intended
   position. Resolve by stable media identity, not title alone or a stale ratingKey.
+- If Plex still lists the item but its path is inaccessible to the manager, retain
+  and reconcile the playlist reference from Plex metadata; warn and skip local
+  integrity probing rather than treating the item as absent from the library.
 - If not indexed, first check whether its known source/destination volume and
   library paths are accessible, including any successful balancer move record.
   A missing or malfunctioning disk is not evidence of a watched/deleted item.
@@ -271,14 +311,12 @@ manager can rebuild references inside the SAME managed playlist ID, using the
 saved ordered URI. This does not delete media or the playlist itself. A partial
 update can be retried from saved intent with `-Apply -RecoverOnly`.
 
-Once initialized, unexplained additional items or reordering is treated as a
-possible manual edit and blocks writes. `-AcceptManualOrder` explicitly authorizes
-RESTORING the saved intended order, not importing an arbitrary new rule. Missing
-entries alone are treated as recoverable; deliberate individual removals are
-therefore not inferred automatically. Until an explicit removal/tombstone UI is
-implemented, turn maintenance off before manually changing the managed playlist.
-Watched removal remains disabled, so recovery cannot resurrect a manager-deleted
-media file. The original manual playlist is read-only throughout.
+The managed playlist can be edited by the manager or manually as needed. Manual
+additions, removals, or reordering do not block manager applies; the manager
+reconciles the managed copy to its saved intended order, so a manual change that
+should persist must also be reflected in the manager's saved inputs. A concurrency
+check still prevents overwriting edits made while an apply is in progress. The
+original manual playlist is read-only throughout.
 
 ## Tests
 

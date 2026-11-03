@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Live view of what the balancer is doing right now.
 
@@ -111,105 +111,6 @@ function Watch-Status {
     }
 }
 
-# ---- failing disks, reported only when they are actually costing something ---
-#
-# balance.ps1 refuses to read a drive whose disk is logging hardware errors, and
-# narrates that in the run log every hour. Both halves of that sentence matter. In
-# the log it is correct and it is exactly what you want when reading an incident
-# back. In a status display it is noise: a sink drive whose reads are skipped has
-# lost nothing, because the balancer still writes to it and nothing on it was ever
-# going to move. Repeating that hourly teaches you to scroll past it, which is the
-# worst outcome available - it is also what a genuinely broken drive looks like.
-#
-# So the three questions below are separated. What is failing is Get-FailingDrive.
-# Whether that costs anything is Get-DriveAlert. Only the second one is displayed.
-
-# Disk number out of a Windows storage error message, or $null if it names no disk.
-# 153/154 say "Disco 4" on a Portuguese system and "Disk 4" on an English one; 51
-# names the device, "\Device\Harddisk3\DR3", which reads the same in any locale.
-# Event ID 153 is also used by unrelated subsystems - VBS status, the display
-# driver - so a message that names no disk is ignored rather than guessed at.
-function Get-DiskFromMessage {
-    param([string]$Message)
-    if (-not $Message) { return $null }
-    if ($Message -match 'Dis[ck]o?\s+(\d+)') { return [int]$Matches[1] }
-    if ($Message -match 'Harddisk(\d+)\\DR') { return [int]$Matches[1] }
-    return $null
-}
-
-# Physical disk number -> how many errors it logged. Takes the events as an
-# argument rather than reading the log itself, so the parsing can be tested
-# against real wording on a machine where nothing is actually failing.
-function Get-FailingDiskMap {
-    param($Events)
-    $byDisk = @{}
-    foreach ($e in @($Events)) {
-        if ($null -eq $e) { continue }
-        $num = Get-DiskFromMessage (Get-Prop $e 'Message')
-        if ($null -eq $num) { continue }
-        if ($byDisk.ContainsKey($num)) { $byDisk[$num]++ } else { $byDisk[$num] = 1 }
-    }
-    return $byDisk
-}
-
-# Drive letter -> the failing disk it sits on, for balancer drives only. Errors
-# on a disk that holds none of the configured drives are not the balancer's
-# business and are not reported.
-function Get-FailingDrive {
-    param($Cfg)
-    $drives = Get-Prop $Cfg 'drives'
-    if ($null -eq $drives) { return @{} }
-
-    $window = Get-Prop $Cfg 'driveErrorWindowHours'
-    if (-not $window) { $window = 24 }
-    $since = (Get-Date).AddHours(-[int]$window)
-    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 51, 153, 154, 157
-                StartTime = $since } -MaxEvents 200 -ErrorAction SilentlyContinue)
-    $byDisk = Get-FailingDiskMap -Events $events
-    if (-not $byDisk.Count) { return @{} }
-
-    # Looked up by disk number rather than per drive letter: two calls when two
-    # disks are failing, instead of one for every drive in the config.
-    $out = @{}
-    foreach ($diskNo in @($byDisk.Keys)) {
-        $parts = @(Get-Partition -DiskNumber $diskNo -ErrorAction SilentlyContinue |
-                Where-Object { $_ -and $_.DriveLetter })
-        foreach ($part in $parts) {
-            $letter = "$($part.DriveLetter):"
-            if ($null -eq (Get-Prop $drives $letter)) { continue }
-            $out[$letter] = [pscustomobject]@{ Disk = $diskNo; Errors = $byDisk[$diskNo] }
-        }
-    }
-    return $out
-}
-
-# What a failing disk is actually costing on this drive, or $null when it is
-# costing nothing. Two things count, and both are moves:
-#   - the drive is a source, so nothing on it can move while its reads are blocked
-#   - a move touching it failed, which is the drive making the decision for us
-# A drive that is only ever a destination is silent: skipping its reads changes
-# nothing about where files end up.
-function Get-DriveAlert {
-    param([string]$Letter, $Cfg, $Failing, $Failures)
-    $info = Get-Prop $Failing $Letter
-    if ($null -eq $info) { return $null }
-
-    $bits = @()
-    if (Get-Prop (Get-Prop (Get-Prop $Cfg 'drives') $Letter) 'sources') {
-        $bits += 'reads blocked, content cannot move off'
-    }
-
-    $here = @(@($Failures) | Where-Object {
-            $route = Get-Route $_
-            $route -and ($route -match [regex]::Escape($Letter))
-        })
-    if ($here.Count) { $bits += ('{0} move(s) failed here today' -f $here.Count) }
-
-    if (-not $bits.Count) { return $null }
-    return ('disk {0} failing, {1} I/O error(s) in {2}h - {3}' -f
-        $info.Disk, $info.Errors, (Get-Prop $Cfg 'driveErrorWindowHours'), ($bits -join '; '))
-}
-
 # A run that overran its deadline or died before it could say anything. The
 # watchdog kills a child that runs too long; a child that exits without a summary
 # line is the same failure seen from the far side. Neither shows up in
@@ -234,6 +135,104 @@ function Get-Width {
     # redirected or headless: assume a normal modern console
     if ($cw -lt 40) { $cw = 100 }
     return [Math]::Min(120, [Math]::Max(74, $cw - 1))
+}
+
+function Get-PlaylistNoticeRows {
+    param($Notices, [string[]]$CycleStopReasons = @())
+    $rows = @()
+    foreach ($notice in $Notices.PSObject.Properties) {
+        $key = [string]$notice.Name
+        $value = [string]$notice.Value
+        $category = 'INFO'
+        $text = $value
+        if ($key -like 'cadence-gap-live-*' -or $key -like 'cadence-gap-intended-*') {
+            $category = if ($key -like 'cadence-gap-live-*') { 'ACTION' } else { 'PLAN' }
+            if ($value -match 'gap: (\d+) TV episodes between movie #(\d+) ''(.*?)'' and movie #(\d+) ''(.*?)'' \(expected (\d+)\)') {
+                $text = "Cadence $($Matches[1])/$($Matches[6]) episodes (#$($Matches[2]) -> #$($Matches[4])): $($Matches[3]) -> $($Matches[5])"
+            }
+            elseif ($value -match 'gap: (\d+) TV episodes between movies ''(.*?)'' and ''(.*?)'' \(expected (\d+)\)') {
+                $text = "Cadence $($Matches[1])/$($Matches[4]) episodes: $($Matches[2]) -> $($Matches[3])"
+            }
+        }
+        elseif ($key -like 'unresolved-*') {
+            $category = 'ACTION'
+            $text = $value -replace '^Missing/ambiguous item:', 'Plex item missing/ambiguous:' -replace '\. No playlist write until recovery is complete\.?$', ''
+        }
+        elseif ($key -like 'file-unavailable-*') {
+            $category = 'CHECK'
+            $text = $value -replace '^Plex still lists ', 'Plex lists ' -replace ', so it remains in the managed queue\.', '; retained in queue.' -replace '\. File probing is skipped; playlist membership follows Plex''s library record\.?$', ''
+        }
+        elseif ($key -like 'tv-missing-*') {
+            $category = 'LIBRARY'
+            $text = $value -replace ': aired/released episodes absent locally:', ': missing locally:' -replace '\. Air dates do not guarantee download availability\.?$', ''
+        }
+        elseif ($value -match '^Cycle (\d+) stopped after (\d+) of (\d+) show slots; blocked: (.*)\. Resume at this show') {
+            $category = 'CYCLE'
+            $text = "Cycle $($Matches[1]) stopped after $($Matches[2])/$($Matches[3]) slots; blocked: $($Matches[4]). Resume here when content/replacement is ready."
+        }
+        elseif ($value -match '^Cycle (\d+) paused: only (\d+) of (\d+) active shows.*; blocked: (.*); no partial cycle queued') {
+            $category = 'CYCLE'
+            $text = "Cycle $($Matches[1]) paused: $($Matches[2])/$($Matches[3]) eligible; blocked: $($Matches[4]); no partial cycle was queued."
+        }
+        elseif ($value -match '^Cycle (\d+) paused: only (\d+) of (\d+) active shows') {
+            $category = 'CYCLE'
+            $text = "Cycle $($Matches[1]) paused: $($Matches[2])/$($Matches[3]) active shows are eligible; no partial cycle was queued."
+        }
+        $rows += [pscustomobject]@{ Key=$key; Category=$category; Text=$text }
+    }
+    foreach ($reason in $CycleStopReasons) {
+        $cycleNumber = 0
+        if ($reason -match '^Cycle (\d+) (?:paused|stopped)\b') { $cycleNumber = [int]$Matches[1] }
+        if (@($rows | Where-Object { $_.Category -eq 'CYCLE' -and $_.Text -match "^Cycle $cycleNumber (?:paused|stopped)" }).Count) { continue }
+        $text = $reason
+        if ($reason -match '^Cycle (\d+) stopped after (\d+) of (\d+) show slots; blocked: (.*)\. Resume at this show') {
+            $text = "Cycle $($Matches[1]) stopped after $($Matches[2])/$($Matches[3]) slots; blocked: $($Matches[4]). Resume here when content/replacement is ready."
+        }
+        elseif ($reason -match '^Cycle (\d+) paused: only (\d+) of (\d+) active shows.*; blocked: (.*); no partial cycle queued') {
+            $text = "Cycle $($Matches[1]) paused: $($Matches[2])/$($Matches[3]) eligible; blocked: $($Matches[4]); no partial cycle was queued."
+        }
+        elseif ($reason -match '^Cycle (\d+) paused: only (\d+) of (\d+) active shows') {
+            $text = "Cycle $($Matches[1]) paused: $($Matches[2])/$($Matches[3]) active shows are eligible; no partial cycle was queued."
+        }
+        $rows += [pscustomobject]@{ Key='cycle-stop-report'; Category='CYCLE'; Text=$text }
+    }
+    $rank = @{ ACTION=0; CHECK=1; PLAN=2; CYCLE=3; LIBRARY=4; INFO=5 }
+    return @($rows | Sort-Object @{Expression={ $rank[$_.Category] }}, Text)
+}
+
+function Get-PlaylistRunSummary {
+    param($LastResult)
+    if (-not $LastResult) { return $null }
+    if ($LastResult.Apply -and -not $LastResult.Verified) {
+        return [pscustomobject]@{ Text=("LAST APPLY NOT VERIFIED: {0} live / {1} proposed; see queue preview before retrying." -f $LastResult.CurrentCount,$LastResult.DesiredCount); Color='Red' }
+    }
+    if ($LastResult.Verified) {
+        return [pscustomobject]@{ Text=("Last apply verified: {0} managed items." -f $LastResult.DesiredCount); Color='Green' }
+    }
+    return [pscustomobject]@{ Text=("Latest run was preview only: {0} live / {1} proposed; no playlist writes." -f $LastResult.CurrentCount,$LastResult.DesiredCount); Color='DarkGray' }
+}
+
+function Format-StatusWrappedText {
+    param([string]$Text, [int]$Width = 100, [string]$Prefix = '  ')
+    $width = [Math]::Max(40, $Width)
+    $available = [Math]::Max(20, $width - $Prefix.Length)
+    $lines = @()
+    $line = ''
+    $continuation = ' ' * $Prefix.Length
+    foreach ($word in ($Text -split '\s+')) {
+        if (-not $word) { continue }
+        if ($line -and ($line.Length + 1 + $word.Length) -gt $available) {
+            $linePrefix = if ($lines.Count -eq 0) { $Prefix } else { $continuation }
+            $lines += ($linePrefix + $line)
+            $line = $word
+        }
+        else { $line = if ($line) { "$line $word" } else { $word } }
+    }
+    if ($line) {
+        $linePrefix = if ($lines.Count -eq 0) { $Prefix } else { $continuation }
+        $lines += ($linePrefix + $line)
+    }
+    return $lines
 }
 
 # Drive letter off the front of a full path: "D:\Filmes\x.mkv" -> "D:"
@@ -432,14 +431,45 @@ function Show-Snapshot {
     # Playlist notifications are explicitly requested by the playlist manager's
     # update/recovery policy. Read local state only; status never scans or edits Plex.
     $playlistNoticePath = Join-Path $PSScriptRoot 'playlist-data\notifications.json'
-    if (Test-Path -LiteralPath $playlistNoticePath) {
+    $lastResultPath = Join-Path $PSScriptRoot 'playlist-data\last-result.json'
+    if ((Test-Path -LiteralPath $playlistNoticePath) -or (Test-Path -LiteralPath $lastResultPath)) {
         Write-Host ''
         Write-Host 'PLAYLIST NOTIFICATIONS' -ForegroundColor Cyan
         Write-Host ('-' * $W)
         try {
-            $notices = [System.IO.File]::ReadAllText($playlistNoticePath) | ConvertFrom-Json
-            if (@($notices.PSObject.Properties).Count) {
-                foreach ($notice in $notices.PSObject.Properties) { Write-Host ('  ' + $notice.Value) -ForegroundColor Yellow }
+            $notices = [pscustomobject]@{}
+            if (Test-Path -LiteralPath $playlistNoticePath) {
+                $notices = [System.IO.File]::ReadAllText($playlistNoticePath) | ConvertFrom-Json
+            }
+            $lastResult = $null
+            if (Test-Path -LiteralPath $lastResultPath) { $lastResult = [System.IO.File]::ReadAllText($lastResultPath) | ConvertFrom-Json }
+            $cycleStopReasons = @(Get-Prop $lastResult 'CycleStopReasons' @())
+            $noticeRows = @(Get-PlaylistNoticeRows -Notices $notices -CycleStopReasons $cycleStopReasons)
+            $runSummary = Get-PlaylistRunSummary $lastResult
+            if ($runSummary) { Write-Host ('  ' + $runSummary.Text) -ForegroundColor $runSummary.Color }
+            if ($noticeRows.Count) {
+                $actionCount = @($noticeRows | Where-Object Category -eq 'ACTION').Count
+                $reviewCount = $noticeRows.Count - $actionCount
+                Write-Host ("  {0} notice(s): {1} action, {2} review/info" -f $noticeRows.Count,$actionCount,$reviewCount) -ForegroundColor White
+                foreach ($category in @('ACTION','CHECK','PLAN','CYCLE','LIBRARY','INFO')) {
+                    $group = @($noticeRows | Where-Object Category -eq $category)
+                    if (-not $group.Count) { continue }
+                    $color = switch ($category) {
+                        'ACTION' { 'Yellow' }
+                        'CHECK' { 'Yellow' }
+                        'PLAN' { 'Cyan' }
+                        'CYCLE' { 'Magenta' }
+                        'LIBRARY' { 'DarkGray' }
+                        default { 'DarkGray' }
+                    }
+                    Write-Host ("  {0}" -f $(if ($category -eq 'ACTION') { 'ACTION REQUIRED' } else { $category })) -ForegroundColor $color
+                    foreach ($row in $group) {
+                        $prefix = if ($category -eq 'ACTION') { '    ! ' } else { '    - ' }
+                        foreach ($line in (Format-StatusWrappedText -Text $row.Text -Width $W -Prefix $prefix)) {
+                            Write-Host $line -ForegroundColor $color
+                        }
+                    }
+                }
             }
             else { Write-Host '  no pending playlist notices' -ForegroundColor DarkGray }
         }

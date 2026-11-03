@@ -36,8 +36,8 @@ try {
     $current = @(Read-ManagedItems $script:ManagedPlaylistId)
     $item = Get-PlaylistRetirementCandidate -Current $current -State $state -Show $Show -Season $Season -Episode $Episode -Confirmed ([bool]$ConfirmedPlaylistViewing)
     $path = [IO.Path]::GetFullPath($item.Paths[0])
-    $rootMatches = @($cfg.libraries.roots | ForEach-Object { $_ } | Where-Object { $path.StartsWith($_.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase) })
-    if (-not $rootMatches.Count -or -not [IO.File]::Exists($path)) { throw 'Media file absent or outside configured library roots.' }
+    $configuredRoots = @($cfg.libraries | ForEach-Object { $_.roots })
+    if (-not (Test-PlaylistPathUnderRoots -Path $path -Roots $configuredRoots) -or -not [IO.File]::Exists($path)) { throw 'Media file absent or outside configured library roots.' }
     if (([IO.FileInfo]::new($path).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Refusing to delete a reparse-point media file.' }
     function Assert-NotPlaying {
         $sessions = Invoke-PlaylistPlex '/status/sessions'
@@ -87,11 +87,9 @@ try {
         Status='Pending'; Deleted=$false; QueueUpdated=$false }
     Write-PlaylistJson (Join-Path $data ('before-retirement-'+$item.Key+'.json')) $state
     Write-PlaylistJson $transactionPath $transaction
-    # Exclusive handle + DeleteOnClose avoids closing an exclusive test handle
-    # and then racing a new Plex reader before deleting. No folder recursion.
-    $handle = [IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None,4096,[IO.FileOptions]::DeleteOnClose)
-    $handle.Dispose()
-    if ([IO.File]::Exists($path)) { throw 'File still exists; transaction retained for inspection.' }
+    # The shared helper clears ReadOnly only for this confirmed deletion and
+    # restores attributes if exclusive deletion fails. No folder recursion.
+    [void](Remove-PlaylistRetirementFile -Path $path)
     $transaction.Deleted=$true; $transaction.Status='FileDeleted'
     Write-PlaylistJson $transactionPath $transaction
     # Durable removal before playlist edits: recovery must never resurrect this

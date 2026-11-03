@@ -8,7 +8,6 @@
   "sinkOrder": "bestFit",
   "unitOrder": "smallestFirst",
   "statusDisplayOrder": ["C:", "K:", "D:", "F:", "G:", "H:", "J:"],
-  "driveErrorWindowHours": 24,
   "recycleReclaim": true,
 
   "downloadGuard": {
@@ -63,7 +62,7 @@
       "downloadSignalGB": 250
     },
     "K:": {
-      "comment": "USB drive - takes from C:, pushes to D:, F:, G:, H: and J:. A source again as of 2026-10-06; it was held back because Windows was blaming this disk for errors that belonged to a different one. It logged 44,249 paging errors and 2,623 hardware I/O failures in September, so if it starts reporting errors again it will be held out of reads once more.",
+      "comment": "USB drive - takes from C:, pushes to D:, F:, G:, H: and J:. Configured as a source and destination.",
       "sources": true,
       "drain": "always",
       "alsoSink": true,

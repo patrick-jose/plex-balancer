@@ -37,7 +37,7 @@ to.
 | `status.ps1` | Live view of what is running right now. |
 | `config.json` | Your policy: drive roles, limits, thresholds. **Not committed** - it names your drive letters and paths. Copy `config.example.json` and edit that. |
 | `config.example.json` | The committed template, with placeholder paths. Copy it to `config.json` on a new machine. |
-| `logs\` | JSONL audit logs, one file per day, pruned after `logRetentionDays`, plus two state files that are never pruned: `state.json`, and `diskmap.json` (which physical disk held each failing disk number, so errors can be attributed to the right drive - see [Failing drives](#failing-drives)). |
+| `logs\` | JSONL audit logs, one file per day, pruned after `logRetentionDays`, plus the balancer state file `state.json`, which is never pruned. |
 | `Run-Tests.ps1` | Runs every suite and reports one verdict. Start here - see [Tests](#tests). |
 | `COMMANDS.md` | This file. |
 | `tests\` | Test suites. Run them before trusting a change - see [Tests](#tests). |
@@ -221,7 +221,7 @@ than the next one.
 >
 > The version that was switched off on 2026-10-03 asked the shell for the Recycle
 > Bin. That namespace is *shell-wide*, so enumerating it walked `$Recycle.Bin` on
-> every mounted volume - including two drives then logging hardware errors - and a
+> every mounted volume - including two mounted volumes - and a
 > COM enumeration cannot be given a timeout. It now walks each volume's
 > `$Recycle.Bin\<SID>` folder by path instead. Three things follow from that:
 >
@@ -532,14 +532,13 @@ Three outcomes the summary will not confuse with each other:
 | Suite | Covers |
 |---|---|
 | `tests\cascade-direction.ps1` | Which directions the cascade allows, and that the parking lot does not slide to another drive when the last drive is absent. |
-| `tests\disk-identity.ps1` | Attributing a disk error to the drive that actually caused it when Windows has reassigned disk numbers: the exact 2026-10-06 misattribution, and the limit that errors already logged cannot be re-resolved. |
 | `tests\download-guard.ps1` | The [download guard](#the-download-guard): that a finished torrent still blocks, that a prefix is matched on a separator boundary, that the UTF-8 decode and multi-torrent parsing survive, and that an unreachable client falls back instead of failing open. Source checks cover the PID-based shutdown gate added after a startup race closed a Windows-started client on 2026-10-07; these checks do **not** simulate that race. Talks to `tests\_fake-qbittorrent.ps1`; never touches the real client. |
 | `tests\empty-source-folders.ps1` | After a verified move, empty source Season/Show folders are removed without deleting the library root, other episodes, hidden files, or folders outside that root; dry runs leave everything in place. Uses only temporary files. |
 | `tests\playlist-manager.ps1` | Active/standby TV rounds, bounded random movie/group scheduling, stable recovery identities, provider-status fakes, original/media API guards, atomic state, and real synchronization against a fake Plex backend. |
 | `tests\playlist-preview.ps1` | Read-only discovery's pure 25-show round planner. No live Plex or internet requests. |
 | `tests\playlist-retirement.ps1` | Explicitly confirmed watched-head eligibility; refuses unwatched, ambiguous or concurrently changed queue items. |
 | `tests\status-watch.ps1` | Scheduled-run deadline refresh, normal polling, startup delay/stale-task handling, and the actual watch loop with a fake clock. |
-| `tests\drive-health.ps1` | Reading a disk number out of a Windows error message in both English and Portuguese, and mapping a drive letter to a physical disk. |
+| `tests\drive-health.ps1` | Confirms hardware/paging-error events do not gate moves or produce status reports, while unrelated drive readiness and active-file safeguards remain. |
 | `tests\shed-gate.ps1` | The demand gate on the last drive: that it blocks when nothing is waiting, opens when something is, and **cannot grant a move the direction check refused** — asserted with the demand figure set absurdly high, which is the ping-pong that happened on 2026-10-06. |
 | `tests\recycle-bin.ps1` | Reading an item's origin out of its `$I` record, including two real header layouts with the paths swapped for invented ones, every shape that must be *refused*, and the whole pass over a throwaway `subst` volume. |
 | `tests\retention.ps1` | Which dated logs and which snapshots the prunes destroy and when, that a dry run cannot delete by accident, and that the log prune can only ever reach files directly inside `logs\`. |
@@ -720,69 +719,13 @@ caused all series content to be skipped.
 | `logDir` | `logs` | Where audit logs are written. |
 | `logRetentionDays` | 7 | Watcher deletes dated logs once they reach this age. `0` keeps everything. See [Retention](#retention). |
 | `recycleReclaim` | `true` | [Recycle Bin reclaim](#recycle-bin-reclaim) of library media sitting in the bins. Set `false` to skip it; it then costs one line of output per run. |
-| `driveErrorWindowHours` | 24 | How far back to look for Windows disk errors. Any drive whose physical disk logged a hardware or paging error inside this window is **not read** that run. See [Failing drives](#failing-drives). |
 
-### Failing drives
-
-A drive that is failing does not report an error and move on - it **retries**, and a recursive scan of it blocks the whole run with no way out. On 2026-10-03 two USB drives did this for 40 minutes while the watcher kept starting new runs, and the machine stopped being able to start anything.
-
-So before reading a drive, `balance.ps1` asks Windows which physical disks have logged errors recently and skips those. It watches for:
-
-| Event | Meaning |
-|---|---|
-| 51 | Error during a paging operation |
-| 153 | I/O operation was retried |
-| 154 | I/O operation failed, hardware error |
-| 157 | Device surprise removal |
-
-**The letter comes from the disk's identity, not its number.** These events name a
-disk by number and nothing else - event 154 reads `Disco 3 (nome PDO: \Device\00000059)`
-and event 51 reads `\Device\Harddisk3\DR3`, with no serial number and unnamed
-`EventData`. Disk numbers are reassigned across reboots and USB reconnections, so
-"disk 3" in September is not necessarily the drive holding number 3 now.
-
-That was not theoretical. On 2026-10-06 the gate held `H:` out of a run because the
-drive that had really failed was `K:`, `K:` has since become disk 4, and `H:` is
-disk 3 - while manual moves to `H:` worked perfectly throughout.
-
-Since the events carry too little to resolve retroactively, every run writes the
-identity that holds each failing number into `logs\diskmap.json` and re-resolves the
-letter from that identity. Two consequences:
-
-- **The first run after enabling it can still misattribute**, because there was
-  nothing recorded yet. It says so in the log, and every run after that is correct.
-- **Errors logged before this existed are still attributed to the current holder**,
-  for the same reason. Only errors inside the window from now on are resolved
-  properly.
-
-The map holds only the numbers failing on the current run and is rebuilt rather than
-merged, so a stale entry cannot survive the window and blame an innocent drive on
-the next genuine failure. A drive that has been removed entirely holds nothing out,
-because there is no letter left to skip. A run that skips a drive says so:
-
-```
-AVISO: not reading F: - disk 4 has logged hardware or paging errors in the last 24h. Treat it as failed until it is replaced or the errors stop.
-```
-
-and when the number moved between disks it names the reassignment instead:
-
-```
-AVISO: not reading K: - disk 3 was a different physical disk when the errors were logged - it is K: now
-```
-
-Three consequences worth knowing:
-
-- **Skipping is not deleting.** A skipped drive is simply not scanned. Its files stay exactly where they are.
-- **The gate reopens by itself.** It looks at a moving window, so once the errors age out the drive is scanned again with no config change. If it fails again, it is skipped again.
-- **It only blocks reads.** A drive can still be written to, because a sink is a destination and not a scan target. On K: and F: that is deliberate for now, and it is the reason those two drives should be replaced rather than trusted - see [Known gaps](#known-gaps).
-
-If a drive is skipped, the run continues normally and simply plans less. There is no separate failure mode to handle.
 
 ### Per-drive settings
 
 | Key | Applies to | Meaning |
 |---|---|---|
-| `sources` | C:, K:, D:, F:, G:, H: | Drive offers files to be moved out. Only `J:` is `false` - it is the end of the chain and is never read. **K:, `F:` and `H:` were `false` until 2026-10-06**, when they became sources again: they had been held back because Windows was reporting one disk's errors against whichever drive held that disk *number* at the time, and the true chain `C: -> K: -> D: -> F: -> G:` could not reach `J:` at all without them. See [Failing drives](#failing-drives). |
+| `sources` | C:, K:, D:, F:, G:, H: | Drive offers files to be moved out. Only `J:` is `false` - it is the end of the chain and is never read. |
 | `alsoSink` | K:, D:, G:, F: | Drive is both a source and a destination. Required on any source that also needs to receive. |
 | `drain` | C:, K: | `always` means offer files unconditionally. |
 | `maxFillPct` | D:, G:, F: | Become a source once free space drops below `100 - maxFillPct` percent. Set to 95, so a drive only gives content away when it is genuinely nearly full. Without it a source must also set `drain`. |
@@ -1034,22 +977,6 @@ reconcile first on every scheduled cycle, so unattended recovery is automatic.
 
 ## Troubleshooting
 
-**"not reading F: - disk 4 has logged hardware errors."**
-Working as intended, and worth acting on. Windows has recorded hardware or paging
-errors for that drive inside `driveErrorWindowHours`, so the run skipped it rather
-than risk blocking. To see the raw evidence:
-
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='System'; Id=51,153,154,157;
-                               StartTime=(Get-Date).AddHours(-6)} |
-  Select-Object TimeCreated,Id,Message | Format-List
-
-Get-Partition -DriveLetter F          # which physical disk the letter maps to
-```
-
-The drive is not repaired by waiting. It re-enters the run once its errors age
-out of the window, which is the point at which you should have replaced it - the
-gate stops a drive from being read, it does not stop a disk from dying.
 
 **A run was killed for exceeding its timeout.**
 Look for the `did not finish within` line in `watch-2026*.log`; the PID it names
@@ -1142,21 +1069,6 @@ before you run it.
 
 Honest list of what is incomplete or worth knowing:
 
-- **The drives that logged hardware errors in September are being read and written
-  again.** `K:` logged tens of thousands of paging errors and thousands of hardware
-  I/O failures; another drive logged a hundred-odd retried reads. They were set to
-  `sources: false` on 2026-10-03 and turned back into sources on 2026-10-06,
-  because holding them back was preventing the chain from reaching `J:` at all and
-  because the gate was misattributing one disk's errors to whichever drive held that
-  disk number at the time - now fixed by keying on the disk's unique id, see
-  [Failing drives](#failing-drives). The event log no longer reports errors against
-  any of them. If they
-  start reporting again the gate will hold them out of reads on its own - but treat
-  every file on them as unbacked-up, and replace them. Nothing in this folder can
-  recover a drive.
-- **A drive whose disk is logging errors is still written to.** The gate in
-  [Failing drives](#failing-drives) protects reads only, and has done since the
-  incident. That is the one deliberate gap left in it.
 - **You cannot force `size` from the command line.** `verify` in `config.json` sets
   the method and `-Hash` forces hashing for one run, but the reverse has no clean
   switch. `-Hash:$false` would do it and does work when `balance.ps1` is called
@@ -1195,8 +1107,7 @@ Honest list of what is incomplete or worth knowing:
   needs an elevated shell to create.
 - **K: is now filled only.** It was briefly both filled and drained, which reversed
   the earlier "keep K: away from 100%" rule at your request. It is no longer a
-  source, so nothing moves off it - see [Failing drives](#failing-drives). It
-  stops accepting at 0.5% free, and the 50% rule still applies to it as a sink.
+  source, so nothing moves off it - as configured. It stops accepting at 0.5% free, and the 50% rule still applies to it as a sink.
 - **Free space on a nearly-full NTFS volume cannot be trusted.** Figures settle
   only after a reboot. The live re-read before each copy mitigates this; it does
   not make the numbers correct.

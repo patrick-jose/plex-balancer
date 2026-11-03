@@ -26,11 +26,8 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_helpers.ps1')
 
-. (Lift-Functions -Script 'balance.ps1' -Names 'Read-RecycleMeta', 'Test-MediaOrigin', 'Get-DriveFree', 'Get-DriveDiskNumber', 'Invoke-RecycleBinReclaim')
+. (Lift-Functions -Script 'balance.ps1' -Names 'Read-RecycleMeta', 'Test-MediaOrigin', 'Get-DriveFree', 'Invoke-RecycleBinReclaim')
 
-# Get-DriveDiskNumber keeps a cache that balance.ps1 fills at line 178, when the
-# script loads. Lifting functions out of the file skips that, so seed it here or
-# the first call throws on a null hashtable.
 $script:diskOfDrive = @{}
 
 $eAcute = [char]0x00E9          # 'e' with an acute accent, as in 'Series'
@@ -511,7 +508,6 @@ $fn = $src.Substring($fnStart, $gateStart - $fnStart)
 Assert-False 'wired: no shell COM object' ($fn -match 'New-Object -ComObject')
 Assert-False 'wired: no shell recycle namespace' ($fn -match 'Namespace\(10\)')
 Assert-False 'wired: no failing-disk gate on the bin' ($fn -match '\$failingDisks')
-Assert-False 'wired: no disk lookup on the bin path' ($fn -match 'Get-DriveDiskNumber')
 Assert-True 'wired: reads the volume before deleting' ($fn -match '\$freeBefore\[.*?\] = Get-DriveFree')
 Assert-True 'wired: reads the volume again after deleting' ($fn -match '\$now = Get-DriveFree')
 Assert-True 'wired: logs the measured figure' ($fn -match "'recycle_verify'")

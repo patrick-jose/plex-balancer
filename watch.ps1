@@ -373,7 +373,7 @@ function Invoke-Balance {
         Write-WatchLog 'balancer was killed. The run did not finish; anything it had copied is left for reconcile to repair next cycle.' 'ERROR'
         return
     }
-    $tail = @($r.Output | Where-Object { $_ -and "$_" -match 'planned:|ALL SINKS|moved:|Warning|Error|not reading' })
+    $tail = @($r.Output | Where-Object { $_ -and "$_" -match 'planned:|ALL SINKS|moved:|Warning|Error' })
     foreach ($l in $tail) { Write-WatchLog ("  {0}" -f $l) }
     if (-not $tail.Count) {
         Write-WatchLog ("  balancer produced no summary line (exit code {0}) - it may have died early" -f $r.ExitCode) 'WARN'

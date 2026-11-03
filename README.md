@@ -97,17 +97,32 @@ rewrite the viewing order.
 - Preserve selected movie/franchise order and related documentary sequences, such
   as the Louis Theroux group. Do not append unrelated random films after the
   selected sequence ends.
-- A missing Plex playlist entry is not proof that its media was deleted or watched:
-  a drive can be temporarily unavailable, Plex can be rescanning, or a file can
-  move. Keep the item's intended queue position, notify and retry recovery when
-  storage is accessible. Do not write a shortened playlist while any intended item
-  remains unresolved. Recovery is limited to the managed copy and does not empty
-  Plex trash or delete media.
-- Watched queue-head retirement is part of playlist maintenance. With
-  `watchedFileDeletion: true`, an apply permanently deletes consecutive watched
-  episode files at the managed queue head after Plex session checks and with a
-  durable recovery transaction. It never skips past an unwatched head item. Set
-  the option `false` to keep media files untouched.
+- Show/movie associations use explicit TMDb IDs in `showMovieLinks`. Linked films
+  are reserved from random selection and anchored after the show's latest episode
+  released before the movie's release date.
+- Plex's library catalog is authoritative for whether media is indexed and
+  eligible for the queue; saved state preserves its intended position. If Plex
+  still lists an item, keep it in the managed queue even if this process cannot
+  access the reported file path. Use MediaInfo only when the file is reachable.
+  If an intended item is absent or ambiguous in Plex, retain its queue intent,
+  refresh/recheck the relevant section, and do not write a shortened playlist.
+  Recovery is limited to the managed copy and does not empty Plex trash or delete
+  media.
+- MediaInfo probing is disabled by default so routine playlist reconciliation
+  uses Plex's catalog and saved state without scanning media files. Set
+  `mediaIntegrityCheckEnabled: true` only when you explicitly want the manager
+  to inspect every reachable file in the proposed queue. Results are cached by
+  path, size, and modification time. A probe alert never changes a file.
+- The manager also checks TV/movie cadence and notifies when a movie boundary
+  inside the TV-bearing queue has four episodes instead of five. Movie-only
+  reserve and franchise tails are excluded.
+- Watched-media retirement is part of playlist maintenance. With
+  `watchedFileDeletion: true`, an apply permanently deletes Plex-watched episode
+  and movie files in the first `watchedRetirementWindow` managed entries
+  (default 5), after session checks and with a durable recovery transaction. The
+  initial window is fixed per run, preserving all other queue order; later
+  positions wait for another run. A watched movie is never randomly replaced.
+  Set `false` to keep media files untouched.
 
 See [PLAYLIST.md](PLAYLIST.md) for the manager commands, durable recovery details,
 and playlist-specific tests. Local queue state and configuration are Git-ignored.
@@ -121,14 +136,6 @@ copies with the shorter names are ignored.
 
 Most of what makes this safe is invisible when it works. These are the decisions
 worth knowing about before you trust it with your library.
-
-**A failing disk is gated on reads, not on hope.** If Windows logs hardware or
-paging errors against a disk, the balancer refuses to *read* that drive. A failing
-disk retries rather than failing, so a recursive scan of one does not error out -
-it blocks, and the run hangs until it is killed. This is not theoretical: it is why
-the tool exists. The gate is time-based and clears itself after
-`driveErrorWindowHours`, and it deliberately does not block writes - see
-[Known gaps](COMMANDS.md#known-gaps) for why that half is open.
 
 **The parking lot is declared, not derived.** The last drive in the chain is read
 from `priority` in `config.json` and nothing else. An earlier version inferred it

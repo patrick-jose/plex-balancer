@@ -70,6 +70,7 @@ function Convert-PlaylistMedia {
         Title = $Node.GetAttribute('title'); SortTitle = $sort; Show = $Node.GetAttribute('grandparentTitle')
         ShowKey = $Node.GetAttribute('grandparentRatingKey'); Season = [int]$Node.GetAttribute('parentIndex')
         Episode = [int]$Node.GetAttribute('index'); ReleaseDate = $Node.GetAttribute('originallyAvailableAt')
+        AddedAt = [long]$Node.GetAttribute('addedAt')
         Watched = ([int]$Node.GetAttribute('viewCount') -gt 0); SectionId = $section
         Paths = @($Node.SelectNodes('Media/Part') | ForEach-Object { $_.GetAttribute('file') } | Where-Object { $_ })
         Collections = @($Node.SelectNodes('Collection') | ForEach-Object { $_.GetAttribute('tag') }) }
@@ -97,6 +98,51 @@ function Test-PlaylistMediaPresent {
         } catch { }
     }
     return $false
+}
+
+function Test-PlaylistMediaProbeJson {
+    param([string]$Json, [long]$ExpectedSize = 0)
+    try { $document = $Json | ConvertFrom-Json -ErrorAction Stop }
+    catch { return [pscustomobject]@{ Healthy=$false; Reason='MediaInfo returned invalid metadata JSON.' } }
+    $tracks = @($document.media.track)
+    $generalTracks = @($tracks | Where-Object { $_.'@type' -eq 'General' })
+    $videoTracks = @($tracks | Where-Object { $_.'@type' -eq 'Video' })
+    if (-not $generalTracks.Count) {
+        return [pscustomobject]@{ Healthy=$false; Reason='MediaInfo could not read a general/container track.' }
+    }
+    if (-not $videoTracks.Count) {
+        return [pscustomobject]@{ Healthy=$false; Reason='MediaInfo found no video stream; the file may be truncated or corrupt.' }
+    }
+    $general = $generalTracks[0]
+    $reportedSize = 0L
+    if ($ExpectedSize -gt 0 -and [long]::TryParse([string]$general.FileSize, [ref]$reportedSize) -and $reportedSize -ne $ExpectedSize) {
+        return [pscustomobject]@{ Healthy=$false; Reason=("MediaInfo reports {0} bytes but the file has {1}; possible truncation." -f $reportedSize,$ExpectedSize) }
+    }
+    return [pscustomobject]@{ Healthy=$true; Reason='' }
+}
+
+function Test-PlaylistMediaPartIntegrity {
+    param([string]$Path, [string]$MediaInfoPath = '')
+    if (-not $MediaInfoPath) {
+        $command = Get-Command MediaInfo.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($command) { $MediaInfoPath = $command.Source }
+    }
+    if (-not $MediaInfoPath -or -not (Test-Path -LiteralPath $MediaInfoPath -PathType Leaf)) {
+        return [pscustomobject]@{ Available=$false; Healthy=$false; Reason='MediaInfo is not installed or configured.' }
+    }
+    if (-not [IO.File]::Exists($Path)) {
+        return [pscustomobject]@{ Available=$true; Healthy=$false; Reason='File is unavailable; integrity probe skipped.' }
+    }
+    try {
+        $size = [long]([IO.FileInfo]::new($Path)).Length
+        $output = & $MediaInfoPath --Output=JSON $Path 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) { return [pscustomobject]@{ Available=$true; Healthy=$false; Reason=("MediaInfo exited with code {0}." -f $exitCode) } }
+        $json = @($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+        $probe = Test-PlaylistMediaProbeJson -Json $json -ExpectedSize $size
+        return [pscustomobject]@{ Available=$true; Healthy=$probe.Healthy; Reason=$probe.Reason }
+    }
+    catch { return [pscustomobject]@{ Available=$true; Healthy=$false; Reason='MediaInfo could not read the file.' } }
 }
 
 function Get-PlaylistTmdbCredential {
@@ -184,13 +230,24 @@ function Get-PlaylistRounds {
         $seed = @($Original | Where-Object { $_.Type -eq 'episode' -and $_.ShowKey -eq $show.Key } | Sort-Object Season, Episode | Select-Object -First 1)
         $anchor = if ($seed.Count) { [long]$seed[0].Season * 10000 + $seed[0].Episode } else { 1 }
         $after = if ($Cursors.ContainsKey($show.Identity)) { [long]$Cursors[$show.Identity] } else { 0 }
+        # A newly added show with no source-playlist anchor starts at its first
+        # downloaded unwatched episode. Do not block it on absent older seasons
+        # from before it entered the managed rotation.
+        if (-not $seed.Count -and -not $after) {
+            $firstLocal = @($Episodes | Where-Object { $_.ShowKey -eq $show.Key -and $_.Season -gt 0 -and -not $_.Watched } | Sort-Object Season, Episode | Select-Object -First 1)
+            if ($firstLocal.Count) { $anchor = [long]$firstLocal[0].Season * 10000 + $firstLocal[0].Episode }
+        }
         $queue[$show.Identity] = @($Episodes | Where-Object {
             $_.ShowKey -eq $show.Key -and $_.Season -gt 0 -and -not $_.Watched -and
             ([long]$_.Season * 10000 + $_.Episode) -ge $anchor -and ([long]$_.Season * 10000 + $_.Episode) -gt $after
         } | Sort-Object Season, Episode, Key | Group-Object Season, Episode | ForEach-Object { $_.Group[0] })
         $status = $TvStatus[$show.Identity]
-        if ($status -and $status.Known -and @($status.Missing).Count) {
-            $firstMissing = [long](($status.Missing.Number | Measure-Object -Minimum).Minimum)
+        $relevantMissing = @()
+        if ($status -and $status.Known) {
+            foreach ($gap in @($status.Missing)) { if ([long]$gap.Number -ge [long]$anchor) { $relevantMissing += $gap } }
+        }
+        if ($relevantMissing.Count) {
+            $firstMissing = [long](($relevantMissing.Number | Measure-Object -Minimum).Minimum)
             $queue[$show.Identity] = @($queue[$show.Identity] | Where-Object { ([long]$_.Season * 10000 + $_.Episode) -lt $firstMissing })
         }
         if ($status -and $status.Known -and @(Get-PlaylistProp $status 'Future' @()).Count) {
@@ -237,7 +294,10 @@ function Get-PlaylistRounds {
             # any released-but-missing episode blocks it; otherwise an exhausted
             # show may be replaced when an inactive show has downloadable episodes.
             $noMissing = $status -and $status.Known -and @($status.Missing).Count -eq 0
-            $done = $finished -or $noMissing
+            # An ended show with no next local episode is replaceable even when
+            # Plex/TMDb reports old released gaps. A newly added show must have
+            # an unwatched local episode and becomes the 25th active show.
+            $done = $finished -or $noMissing -or ($status -and $status.Known -and $status.Ended)
             if ($manual) {
                 $candidate = @($Shows | Where-Object { $_.Title -eq $replacement[0].to })
                 # A replacement is eligible only when the Plex library already
@@ -249,18 +309,22 @@ function Get-PlaylistRounds {
                     continue
                 }
             }
-            elseif ($done) {
+            elseif ($done -or -not $status -or -not $status.Known) {
                 # Stop at the blocker when no replacement is actually available.
-                # If a newly downloaded standby is ready, substitute it into the
-                # active roster; emission below sorts it into the rotation order.
-                $downloadedStandby = @($Shows | Where-Object { $_.Identity -notin $nextActive.Identity -and $queue[$_.Identity].Count } | Sort-Object SortTitle, Identity)
+                # An exhausted show with unknown provider status may still be
+                # replaced when Plex has no eligible next episode and a standby
+                # has downloaded unwatched content. Known missing releases remain
+                # protected by the checks above.
+                $downloadedStandby = @($Shows | Where-Object { $_.Identity -notin $nextActive.Identity -and $queue[$_.Identity].Count } |
+                    Sort-Object @{Expression='AddedAt';Descending=$true}, SortTitle, Identity)
                 if ($downloadedStandby.Count) {
                     $candidate = $downloadedStandby[0]
                     $nextActive = @($nextActive | Where-Object { $_.Identity -ne $show.Identity }) + $candidate
                     $retired += [pscustomobject]@{ From = $show.Title; To = $candidate.Title; Round = $number; ManualOverride = $false }
                     continue
                 }
-                $blocked[$show.Identity] = "$($show.Title): no downloadable episodes remain; cycle stops here"
+                if ($done) { $blocked[$show.Identity] = "$($show.Title): no downloadable episodes remain; cycle stops here" }
+                else { $blocked[$show.Identity] = "$($show.Title): no eligible next episode and no downloaded standby is ready; verify status or add content" }
                 continue
             }
             $reason = if ($status -and $status.Known -and $status.NextAirDate) { 'waiting until ' + $status.NextAirDate } else { 'no next local episode; update content or verify series status' }
@@ -272,7 +336,8 @@ function Get-PlaylistRounds {
             if ($show.Identity -in $consumed) { continue }
             $q = @($queue[$show.Identity])
             if (-not $q.Count) {
-                $stop += if ($blocked.ContainsKey($show.Identity)) { $blocked[$show.Identity] } else { "$($show.Title): no next local episode" }
+                $reason = if ($blocked.ContainsKey($show.Identity)) { $blocked[$show.Identity] } else { "$($show.Title): no next local episode" }
+                $stop += "Cycle $number stopped after $($items.Count) of $Count show slots; blocked: $reason. Resume at this show when an eligible episode or replacement is available."
                 break
             }
             $items += $q[0]
@@ -359,9 +424,86 @@ function Get-PlaylistMovieGroups {
     return $groups
 }
 
+function Get-PlaylistShowMovieAnchors {
+    param([object[]]$Shows, [object[]]$Episodes, [object[]]$Movies, [object[]]$ShowMovieLinks = @())
+    $anchors = @()
+    foreach ($movie in $Movies) {
+        if ($movie.Watched) { continue }
+        $movieTmdbId = Get-PlaylistProviderId $movie 'tmdb'
+        if (-not $movieTmdbId) { continue }
+        $links = @($ShowMovieLinks | Where-Object { [string]$movieTmdbId -in @($_.movieTmdbIds | ForEach-Object { [string]$_ }) })
+        if ($links.Count -ne 1) { continue }
+        $showsForMovie = @($Shows | Where-Object { (Get-PlaylistProviderId $_ 'tmdb') -eq [string]$links[0].showTmdbId })
+        if ($showsForMovie.Count -ne 1) { continue }
+        $show = $showsForMovie[0]
+        if (-not $movie.ReleaseDate) { continue }
+        $movieDate = [datetime]::MinValue
+        if (-not [datetime]::TryParse([string]$movie.ReleaseDate, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$movieDate)) { continue }
+        $prior = @()
+        foreach ($candidate in $Episodes) {
+            if ($candidate.ShowKey -ne $show.Key -or $candidate.Season -le 0 -or -not $candidate.ReleaseDate) { continue }
+            $episodeDate = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$candidate.ReleaseDate, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$episodeDate) -and $episodeDate -lt $movieDate) {
+                $prior += [pscustomobject]@{ Media=$candidate; Date=$episodeDate }
+            }
+        }
+        $prior = @($prior | Sort-Object @{Expression='Date';Descending=$true}, @{Expression={ $_.Media.Season };Descending=$true}, @{Expression={ $_.Media.Episode };Descending=$true})
+        if (-not $prior.Count) { continue }
+        $episode = $prior[0].Media
+        $anchors += [pscustomobject]@{ ShowIdentity=$show.Identity; ShowTitle=$show.Title; MovieIdentity=$movie.Identity
+            Movie=$movie; MovieDate=$movieDate.ToString('yyyy-MM-dd'); EpisodeIdentity=$episode.Identity
+            Episode=$episode; EpisodeDate=$episode.ReleaseDate }
+    }
+    return @($anchors | Sort-Object MovieDate, MovieIdentity)
+}
+
+function Set-PlaylistAnchoredMovieQueue {
+    param([object[]]$Queue, [object[]]$Anchors)
+    $result = @($Queue)
+    foreach ($anchor in $Anchors) {
+        $episode = @($result | Where-Object Identity -CEQ $anchor.EpisodeIdentity | Select-Object -First 1)
+        $movieExists = @($result | Where-Object Identity -CEQ $anchor.MovieIdentity).Count -gt 0
+        if (-not $episode.Count -or $anchor.Episode.Watched) {
+            if ($movieExists) { $result = @($result | Where-Object Identity -CNE $anchor.MovieIdentity) }
+            continue
+        }
+        if ($movieExists) { $result = @($result | Where-Object Identity -CNE $anchor.MovieIdentity) }
+        $episodeIndex = -1
+        for ($i = 0; $i -lt $result.Count; $i++) { if ($result[$i].Identity -eq $anchor.EpisodeIdentity) { $episodeIndex = $i; break } }
+        if ($episodeIndex -lt 0) { continue }
+        $result = @($result | Select-Object -First ($episodeIndex + 1)) + @($anchor.Movie) + @($result | Select-Object -Skip ($episodeIndex + 1))
+    }
+    if (@($result.Identity | Select-Object -Unique).Count -ne $result.Count) { throw 'Show/movie anchoring created a duplicate playlist identity.' }
+    return $result
+}
+
+function Get-PlaylistCadencePlan {
+    param([object[]]$Rounds, [int]$EpisodeOffset = 0, [int]$EpisodesPerMovie = 5, [object[]]$Anchors = @())
+    $byEpisode = @{}
+    foreach ($anchor in $Anchors) {
+        if (-not $byEpisode.ContainsKey($anchor.EpisodeIdentity)) { $byEpisode[$anchor.EpisodeIdentity] = @() }
+        $byEpisode[$anchor.EpisodeIdentity] += $anchor
+    }
+    $sinceMovie = $EpisodeOffset
+    $regularSlots = 0
+    $triggered = @()
+    foreach ($round in $Rounds) {
+        foreach ($episode in @($round.Episodes)) {
+            if ($byEpisode.ContainsKey($episode.Identity)) {
+                $triggered += @($byEpisode[$episode.Identity])
+                $sinceMovie = 0
+                continue
+            }
+            $sinceMovie++
+            if ($sinceMovie -ge $EpisodesPerMovie) { $regularSlots++; $sinceMovie = 0 }
+        }
+    }
+    return [pscustomobject]@{ RegularMovieSlots=$regularSlots; TriggeredAnchors=@($triggered); TrailingEpisodeOffset=$sinceMovie }
+}
+
 function Get-PlaylistMovies {
-    param([object[]]$Movies, [object[]]$Groups, [int]$Slots, [int]$Seed, [object[]]$Existing = @(), [object[]]$Preferred = @())
-    $pool = @($Movies | Where-Object { -not $_.Watched } | Sort-Object Identity)
+    param([object[]]$Movies, [object[]]$Groups, [int]$Slots, [int]$Seed, [object[]]$Existing = @(), [object[]]$Preferred = @(), [string[]]$ReservedIdentities = @())
+    $pool = @($Movies | Where-Object { -not $_.Watched -and $_.Identity -notin $ReservedIdentities } | Sort-Object Identity)
     $byId = @{}; foreach ($m in $pool) { $byId[$m.Identity] = $m }
     $groupByMovie = @{}
     foreach ($g in $Groups) { foreach ($m in $g.Members) {
@@ -412,20 +554,50 @@ function Get-PlaylistMovies {
 }
 
 function Merge-PlaylistQueue {
-    param([object[]]$Rounds, [object[]]$Movies, [int]$EpisodesPerMovie = 5, [int]$EpisodeOffset = 0)
-    $queue = @(); $mi = 0; $episodeCount = $EpisodeOffset
+    param([object[]]$Rounds, [object[]]$Movies, [int]$EpisodesPerMovie = 5, [int]$EpisodeOffset = 0, [object[]]$MovieAnchors = @())
+    $queue = @(); $usedMovies = @{}; $episodeCount = $EpisodeOffset
+    $movieById = @{}; foreach ($movie in $Movies) { $movieById[$movie.Identity] = $movie }
+    $anchorByEpisode = @{}; $anchoredMovieIds = @{}
+    foreach ($anchor in $MovieAnchors) {
+        if (-not $anchorByEpisode.ContainsKey($anchor.EpisodeIdentity)) { $anchorByEpisode[$anchor.EpisodeIdentity] = @() }
+        $anchorByEpisode[$anchor.EpisodeIdentity] += $anchor
+        $anchoredMovieIds[$anchor.MovieIdentity] = $true
+    }
+    $mi = 0
     foreach ($round in $Rounds) {
         if (@($round.Episodes).Count -gt 25) { throw 'Rotation segment cannot contain more than 25 shows.' }
         for ($i = 0; $i -lt $round.Episodes.Count; $i++) {
-            $queue += $round.Episodes[$i]
+            $episode = $round.Episodes[$i]
+            $queue += $episode
+            if ($anchorByEpisode.ContainsKey($episode.Identity)) {
+                foreach ($anchor in @($anchorByEpisode[$episode.Identity] | Sort-Object MovieDate, MovieIdentity)) {
+                    if (-not $movieById.ContainsKey($anchor.MovieIdentity)) { throw "Anchored movie '$($anchor.MovieIdentity)' is not in the movie plan." }
+                    if ($usedMovies.ContainsKey($anchor.MovieIdentity)) { throw 'An anchored movie would be queued more than once.' }
+                    $queue += $movieById[$anchor.MovieIdentity]
+                    $usedMovies[$anchor.MovieIdentity] = $true
+                }
+                $episodeCount = 0
+                continue
+            }
             $episodeCount++
-            if ($episodeCount % $EpisodesPerMovie -eq 0) {
+            if ($episodeCount -ge $EpisodesPerMovie) {
+                while ($mi -lt $Movies.Count -and ($anchoredMovieIds.ContainsKey($Movies[$mi].Identity) -or $usedMovies.ContainsKey($Movies[$mi].Identity))) { $mi++ }
                 if ($mi -ge $Movies.Count) { throw 'Not enough movies to complete the TV/movie cadence.' }
-                $queue += $Movies[$mi]; $mi++
+                $queue += $Movies[$mi]
+                $usedMovies[$Movies[$mi].Identity] = $true
+                $mi++
+                $episodeCount = 0
             }
         }
     }
-    while ($mi -lt $Movies.Count) { $queue += $Movies[$mi]; $mi++ }
+    while ($mi -lt $Movies.Count) {
+        $movie = $Movies[$mi]; $mi++
+        if ($anchoredMovieIds.ContainsKey($movie.Identity) -or $usedMovies.ContainsKey($movie.Identity)) { continue }
+        $queue += $movie
+        $usedMovies[$movie.Identity] = $true
+    }
+    $unplacedAnchors = @($MovieAnchors | Where-Object { -not $usedMovies.ContainsKey($_.MovieIdentity) })
+    if ($unplacedAnchors.Count) { throw 'A reserved show movie could not be placed after its anchor episode.' }
     return $queue
 }
 
@@ -466,12 +638,89 @@ function New-PlaylistContinuationState {
         DeletionEnabled = $false; Applied = $false }
 }
 
-function Get-PlaylistWatchedQueueHead {
-    param([object[]]$Queue)
-    if (-not $Queue.Count) { return $null }
-    $head = $Queue[0]
-    if ($head.Type -ne 'episode' -or -not $head.Watched) { return $null }
-    return $head
+function Get-PlaylistWatchedQueueItems {
+    param([object[]]$Queue, [int]$WindowSize = 5)
+    if ($WindowSize -lt 1) { return @() }
+    return @($Queue | Select-Object -First $WindowSize | Where-Object { $_.Type -in @('episode','movie') -and $_.Watched })
+}
+
+function Get-PlaylistWatchedQueueItem {
+    param([object[]]$Queue, [int]$WindowSize = 5)
+    $items = @(Get-PlaylistWatchedQueueItems -Queue $Queue -WindowSize $WindowSize)
+    if ($items.Count) { return $items[0] }
+    return $null
+}
+
+function Update-PlaylistResultAfterRetirement {
+    param($Result, [int]$RetiredCount, [int]$DesiredCount, [int]$MovieCount)
+    if ($RetiredCount -lt 0 -or $DesiredCount -lt 0 -or $MovieCount -lt 0) { throw 'Playlist result counts cannot be negative.' }
+    $Result.DesiredCount = $DesiredCount
+    $Result.RemovesFromCopy += $RetiredCount
+    $Result.Movies = $MovieCount
+    $Result | Add-Member -NotePropertyName RetiredWatchedItems -NotePropertyValue $RetiredCount -Force
+    return $Result
+}
+
+function Test-PlaylistPendingRetirementFileMissing {
+    param($Transaction, [string[]]$Roots)
+    $script:PlaylistRetirementRecoveryDiagnostic = 'transaction flags do not permit recovery'
+    if (-not $Transaction -or $Transaction.Status -ne 'Pending' -or $Transaction.Deleted -or $Transaction.QueueUpdated) { return $false }
+    $path = [string]$Transaction.Path
+    if (-not (Test-PlaylistPathUnderRoots -Path $path -Roots $Roots)) { $script:PlaylistRetirementRecoveryDiagnostic = 'recorded path is outside configured roots'; return $false }
+    try {
+        $path = [IO.Path]::GetFullPath($path)
+        $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($path))
+        $exists = [IO.File]::Exists($path)
+        $script:PlaylistRetirementRecoveryDiagnostic = "volumeReady=$($drive.IsReady); fileExists=$exists"
+        return $drive.IsReady -and -not $exists
+    }
+    catch { $script:PlaylistRetirementRecoveryDiagnostic = $_.Exception.Message; return $false }
+}
+
+function Test-PlaylistPathUnderRoots {
+    param([string]$Path, [string[]]$Roots)
+    if (-not $Path -or -not [IO.Path]::IsPathRooted($Path)) { return $false }
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        foreach ($configuredRoot in $Roots) {
+            $fullRoot = [IO.Path]::GetFullPath([string]$configuredRoot).TrimEnd('\') + '\'
+            if ($fullPath.StartsWith($fullRoot, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    }
+    catch { return $false }
+    return $false
+}
+
+function Remove-PlaylistRetirementFile {
+    param([string]$Path)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not [IO.File]::Exists($fullPath)) { throw 'Retirement file is already missing.' }
+    $info = [IO.FileInfo]::new($fullPath)
+    if (($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Refusing to retire a reparse-point file.' }
+    $bytes = [long]$info.Length
+    $originalAttributes = $info.Attributes
+    $clearedReadOnly = ($originalAttributes -band [IO.FileAttributes]::ReadOnly) -ne 0
+    try {
+        if ($clearedReadOnly) { [IO.File]::SetAttributes($fullPath, ($originalAttributes -band (-bnot [IO.FileAttributes]::ReadOnly))) }
+        $handle = [IO.FileStream]::new($fullPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None,4096,[IO.FileOptions]::DeleteOnClose)
+        $handle.Dispose()
+        if ([IO.File]::Exists($fullPath)) { throw 'File still exists after DeleteOnClose.' }
+        return [pscustomobject]@{ Bytes=$bytes; ReadOnlyCleared=$clearedReadOnly }
+    }
+    catch {
+        if ($clearedReadOnly -and [IO.File]::Exists($fullPath)) {
+            try { [IO.File]::SetAttributes($fullPath, $originalAttributes) }
+            catch { Write-Warning "Could not restore original file attributes for ${fullPath}: $($_.Exception.Message)" }
+        }
+        throw
+    }
+}
+
+function Test-PlaylistSourceMatchesAfterRetirements {
+    param([object[]]$Original, [object[]]$Current, [string[]]$RetiredIdentities)
+    $expected = @($Original | Where-Object { $_.Identity -notin $RetiredIdentities } | ForEach-Object Identity)
+    $actual = @($Current | ForEach-Object Identity)
+    return ($expected -join '|') -ceq ($actual -join '|')
 }
 
 function Replace-PlaylistMissingMovieSlots {
@@ -495,6 +744,19 @@ function Replace-PlaylistMissingMovieSlots {
     return [pscustomobject]@{ Queue = $updatedQueue; Movies = $updatedMovies }
 }
 
+function Remove-PlaylistMovieSlot {
+    param([object[]]$Queue, [object[]]$MovieOrder, [string]$Identity)
+    $queueMatches = @($Queue | Where-Object Identity -CEQ $Identity)
+    $movieMatches = @($MovieOrder | Where-Object Identity -CEQ $Identity)
+    if ($queueMatches.Count -ne 1 -or $queueMatches[0].Type -ne 'movie' -or $movieMatches.Count -ne 1) {
+        throw "Expected one matching movie queue slot for $Identity."
+    }
+    return [pscustomobject]@{
+        Queue = @($Queue | Where-Object Identity -CNE $Identity)
+        Movies = @($MovieOrder | Where-Object Identity -CNE $Identity)
+    }
+}
+
 function Get-PlaylistRetirementCandidate {
     param([object[]]$Current, $State, [string]$Show, [int]$Season, [int]$Episode, [bool]$Confirmed)
     if (-not $Confirmed) { throw 'User confirmation of playlist viewing is required.' }
@@ -509,7 +771,7 @@ function Get-PlaylistRetirementCandidate {
 }
 
 function Merge-PlaylistContinuation {
-    param([object[]]$BaseQueue, [object[]]$Rounds, [object[]]$Movies)
+    param([object[]]$BaseQueue, [object[]]$Rounds, [object[]]$Movies, [object[]]$MovieAnchors = @())
     # Preserve existing relative order, but continue the TV sequence BEFORE the
     # movie-only reserve. A full five-episode block consumes its following movie;
     # a partial block resumes before that movie, carrying its episode count.
@@ -521,7 +783,7 @@ function Merge-PlaylistContinuation {
     $newMovies = @($Movies | Select-Object -Skip $baseMovies.Count)
     $context = Get-PlaylistContinuationContext $BaseQueue
     $availableMovies = @($context.Tail) + $newMovies
-    $extension = @(Merge-PlaylistQueue -Rounds $Rounds -Movies $availableMovies -EpisodeOffset $context.Offset)
+    $extension = @(Merge-PlaylistQueue -Rounds $Rounds -Movies $availableMovies -EpisodeOffset $context.Offset -MovieAnchors $MovieAnchors)
     $result = @($context.Prefix) + $extension
     if (@($result.Identity | Select-Object -Unique).Count -ne $result.Count) { throw 'Continuation would re-add an already queued item.' }
     return $result
@@ -538,6 +800,26 @@ function Get-PlaylistContinuationContext {
     $offset = $run % 5
     if ($offset -eq 0 -and $lastTv+1 -lt $Queue.Count -and $Queue[$lastTv+1].Type -eq 'movie') { $end++ }
     return [pscustomobject]@{ Prefix=@($Queue | Select-Object -First ($end+1)); Tail=@($Queue | Select-Object -Skip ($end+1)); Offset=$offset }
+}
+
+function Set-PlaylistMovieCadenceOffset {
+    param([object[]]$Queue, [int]$EpisodeOffset, [int]$EpisodesPerMovie = 5)
+    if ($EpisodeOffset -lt 0 -or $EpisodeOffset -ge $EpisodesPerMovie) { throw 'EpisodeOffset must be within the cadence interval.' }
+    $episodes = @($Queue | Where-Object Type -eq 'episode')
+    $movies = @($Queue | Where-Object Type -eq 'movie')
+    $scheduled = @()
+    $movieIndex = 0
+    for ($i = 0; $i -lt $episodes.Count; $i++) {
+        $scheduled += $episodes[$i]
+        $episodeNumber = $i + 1
+        $movieEarned = if ($EpisodeOffset -eq 0) { ($episodeNumber % $EpisodesPerMovie) -eq 0 } else {
+            ($episodeNumber -eq $EpisodeOffset) -or ($episodeNumber -gt $EpisodeOffset -and (($episodeNumber - $EpisodeOffset) % $EpisodesPerMovie) -eq 0)
+        }
+        if ($movieEarned -and $movieIndex -lt $movies.Count) { $scheduled += $movies[$movieIndex]; $movieIndex++ }
+    }
+    if ($movieIndex -lt $movies.Count) { $scheduled += @($movies | Select-Object -Skip $movieIndex) }
+    if (@($scheduled.Identity | Select-Object -Unique).Count -ne $scheduled.Count) { throw 'Cadence adjustment created duplicate playlist identities.' }
+    return $scheduled
 }
 
 function Repair-PlaylistQueueBeforeBlockedShow {
@@ -619,6 +901,32 @@ function Get-PlaylistEpisodeOffset {
     return ($count % 5)
 }
 
+function Get-PlaylistCadenceGaps {
+    param([object[]]$Queue, [int]$EpisodesPerMovie = 5)
+    $items = @($Queue)
+    $lastEpisode = -1
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($items[$i].Type -eq 'episode') { $lastEpisode = $i }
+    }
+    if ($lastEpisode -lt 0) { return @() }
+    $gaps = @()
+    $previousMovie = $null
+    $previousMoviePosition = 0
+    $episodesSinceMovie = 0
+    for ($i = 0; $i -le $lastEpisode; $i++) {
+        if ($items[$i].Type -eq 'episode') { $episodesSinceMovie++; continue }
+        if ($items[$i].Type -ne 'movie') { continue }
+        if ($null -ne $previousMovie -and $i -lt $lastEpisode -and $episodesSinceMovie -eq ($EpisodesPerMovie - 1)) {
+            $gaps += [pscustomobject]@{ PreviousMovie=$previousMovie; PreviousPosition=$previousMoviePosition
+                NextMovie=$items[$i]; NextPosition=($i + 1); EpisodeCount=$episodesSinceMovie }
+        }
+        $previousMovie = $items[$i]
+        $previousMoviePosition = $i + 1
+        $episodesSinceMovie = 0
+    }
+    return $gaps
+}
+
 function Set-PlaylistIntendedItems {
     param([object[]]$Desired, [object[]]$Current)
     if (-not $script:PlaylistApply) { throw 'Playlist writes require -Apply.' }
@@ -668,4 +976,3 @@ function Add-PlaylistAlert {
     param([string]$Id, [string]$Message)
     $script:PlaylistAlerts[$Id] = $Message
 }
-

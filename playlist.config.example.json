@@ -14,8 +14,16 @@
     "extraTitles": ["My Scientology Movie", "Altered States: Love Without Limits"],
     "order": "release"
   }],
+  "showMovieLinks": [
+    { "showTmdbId": "456", "movieTmdbIds": ["35"] },
+    { "showTmdbId": "8592", "movieTmdbIds": ["696507"] },
+    { "showTmdbId": "2190", "movieTmdbIds": ["874299", "874300", "974691", "993729", "1190012", "1219926", "1290938"] }
+  ],
   "scanTimeoutSeconds": 120,
   "metadataCacheHours": 24,
+  "mediaIntegrityCheckEnabled": false,
+  "mediaInfoPath": "",
   "maintenanceEnabled": false,
-  "watchedFileDeletion": true
+  "watchedFileDeletion": true,
+  "watchedRetirementWindow": 5
 }
