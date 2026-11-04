@@ -191,6 +191,29 @@ $resumePlan = Get-PlaylistRounds -Shows ($shows + $standby) -Episodes $resumeQue
 Assert-Equal 'downloaded standby resumes after already-consumed cycle prefix' $resumePlan.Rounds[0].Episodes[0].ShowKey 'show15'
 Assert-Equal 'downloaded standby is sorted into its correct rotation position' $resumePlan.Rounds[0].Episodes[-1].ShowKey 'show26'
 
+$darkMatter = Media 'dark-matter' 'show'
+$darkMatter.Title = 'Dark Matter'; $darkMatter.SortTitle = 'Dark Matter'
+$darkMatterFirst = Media 'darkmatter-s1e1' 'episode' 1 $darkMatter.Key
+$darkMatterFirst.Show = $darkMatter.Title
+$darkMatterNext = Media 'darkmatter-s2e3' 'episode' 3 $darkMatter.Key
+$darkMatterNext.Show = $darkMatter.Title; $darkMatterNext.Season = 2
+$darkMatterEpisodes = @($darkMatterFirst, $darkMatterNext)
+$darkMatterCursors = @{ $shows[0].Identity = 10001; $darkMatter.Identity = 20002 }
+$darkMatterConsumed = @($shows | Sort-Object SortTitle,Identity | Select-Object -Skip 1 -First 12 | ForEach-Object Identity)
+$darkMatterBlockedEpisodes = @($short | Where-Object ShowKey -ne $shows[13].Key) + $darkMatterEpisodes
+$darkMatterBlockedPlan = Get-PlaylistRounds -Shows ($shows + $darkMatter) -Episodes $darkMatterBlockedEpisodes `
+    -Original @() -Replacements @() -TvStatus $knownEnd -Cursors $darkMatterCursors `
+    -ActiveIds @($shows.Identity) -CycleConsumed $darkMatterConsumed -StartRound 8
+Assert-False 'deferred replacement drops its stale cursor before a blocked cycle resumes' `
+    $darkMatterBlockedPlan.Cursors.ContainsKey($darkMatter.Identity)
+$darkMatterPlan = Get-PlaylistRounds -Shows ($shows + $darkMatter) -Episodes (@($short) + $darkMatterEpisodes) `
+    -Original @() -Replacements @() -TvStatus $knownEnd -Cursors $darkMatterCursors `
+    -ActiveIds @($shows.Identity) -CycleConsumed $darkMatterConsumed -StartRound 8
+Assert-False 'alphabetically earlier replacement does not break the consumed cycle order' `
+    ('dark-matter' -in $darkMatterPlan.Rounds[0].Episodes.ShowKey)
+Assert-Equal 'earlier replacement joins at the next cycle boundary' $darkMatterPlan.Rounds[1].Episodes[0].ShowKey 'dark-matter'
+Assert-Equal 'newly activated show ignores its stale later-season cursor' $darkMatterPlan.Rounds[1].Episodes[0].Identity 'darkmatter-s1e1'
+
 $rotationNames = @('The Bear','Castle Rock','Curb Your Enthusiasm','Doctor Who','Euphoria','From','Hacks','House of the Dragon','Impuros',"It's Always Sunny in Philadelphia",'Jury Duty','Lanterns','Louis Theroux: Life on the Edge','Modern Family','New Bandits','Parks and Recreation','Penn & Teller: Fool Us','The Simpsons','The Sopranos','South Park','Spider-Noir','Star Wars: The Clone Wars','Ted Lasso',"Widow's Bay",'X-Men')
 $repairShows = @($rotationNames | ForEach-Object { $s=Media $_ 'show'; if($s.Title -eq 'The Bear'){$s.SortTitle='Bear'}; $s })
 $repairQueue = @(); $repairTv = 0; $repairMovie = 0

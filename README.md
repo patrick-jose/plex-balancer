@@ -91,6 +91,9 @@ rewrite the viewing order.
   episode downloaded locally. Merely being announced, released, or downloadable
   is not enough. Missing released episodes on the outgoing show also prevent a
   replacement.
+- A newly activated series starts at its first local unwatched episode, not a
+  stale saved cursor. If its alphabetical position is already past in the
+  current cycle, it joins at the next cycle boundary.
 - Already watched episodes are skipped. For example, after Penn & Teller S11E06
   and S11E07 were watched, the next queued episode is S11E08; it follows Parks and
   Recreation S05E04 in the current rotation.

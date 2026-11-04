@@ -218,6 +218,18 @@ function Get-PlaylistTvStatus {
     catch { return [pscustomobject]@{ Known = $false; Ended = $false; Final = 0; Missing = @(); Message = $_.Exception.Message; NextAirDate = '' } }
 }
 
+function Test-PlaylistShowBeforeCycleFrontier {
+    param([object[]]$Roster, [string[]]$Consumed, [string]$Identity)
+    $ordered = @($Roster | Sort-Object SortTitle, Identity)
+    $frontier = -1
+    $candidateIndex = -1
+    for ($i = 0; $i -lt $ordered.Count; $i++) {
+        if ($ordered[$i].Identity -in $Consumed) { $frontier = $i }
+        if ($ordered[$i].Identity -eq $Identity) { $candidateIndex = $i }
+    }
+    return ($candidateIndex -ge 0 -and $candidateIndex -lt $frontier)
+}
+
 function Get-PlaylistRounds {
     param([object[]]$Shows, [object[]]$Episodes, [object[]]$Original, [object[]]$Replacements,
         [hashtable]$TvStatus, [int]$Count = 25, [int]$StartRound = 1, [hashtable]$Cursors = @{}, [string[]]$ActiveIds = @(),
@@ -229,10 +241,11 @@ function Get-PlaylistRounds {
     foreach ($show in $Shows) {
         $seed = @($Original | Where-Object { $_.Type -eq 'episode' -and $_.ShowKey -eq $show.Key } | Sort-Object Season, Episode | Select-Object -First 1)
         $anchor = if ($seed.Count) { [long]$seed[0].Season * 10000 + $seed[0].Episode } else { 1 }
-        $after = if ($Cursors.ContainsKey($show.Identity)) { [long]$Cursors[$show.Identity] } else { 0 }
-        # A newly added show with no source-playlist anchor starts at its first
-        # downloaded unwatched episode. Do not block it on absent older seasons
-        # from before it entered the managed rotation.
+        $newActiveShow = $ActiveIds.Count -gt 0 -and $show.Identity -notin $ActiveIds
+        $after = if (-not $newActiveShow -and $Cursors.ContainsKey($show.Identity)) { [long]$Cursors[$show.Identity] } else { 0 }
+        # A newly activated show must not inherit a stale cursor from a prior
+        # roster. Without a source-playlist anchor, begin at its first local
+        # unwatched episode rather than blocking on earlier missing seasons.
         if (-not $seed.Count -and -not $after) {
             $firstLocal = @($Episodes | Where-Object { $_.ShowKey -eq $show.Key -and $_.Season -gt 0 -and -not $_.Watched } | Sort-Object Season, Episode | Select-Object -First 1)
             if ($firstLocal.Count) { $anchor = [long]$firstLocal[0].Season * 10000 + $firstLocal[0].Episode }
@@ -305,6 +318,11 @@ function Get-PlaylistRounds {
                 # metadata alone is not sufficient.
                 if ($candidate.Count -eq 1 -and $candidate[0].Identity -notin $nextActive.Identity -and $queue[$candidate[0].Identity].Count) {
                     $nextActive = @($nextActive | Where-Object { $_.Identity -ne $show.Identity }) + $candidate[0]
+                    [void]$cursor.Remove($candidate[0].Identity)
+                    if ($candidate[0].Identity -notin $consumed -and
+                        (Test-PlaylistShowBeforeCycleFrontier -Roster $nextActive -Consumed $consumed -Identity $candidate[0].Identity)) {
+                        $consumed += $candidate[0].Identity
+                    }
                     $retired += [pscustomobject]@{ From = $show.Title; To = $candidate[0].Title; Round = $number; ManualOverride = $true }
                     continue
                 }
@@ -320,6 +338,11 @@ function Get-PlaylistRounds {
                 if ($downloadedStandby.Count) {
                     $candidate = $downloadedStandby[0]
                     $nextActive = @($nextActive | Where-Object { $_.Identity -ne $show.Identity }) + $candidate
+                    [void]$cursor.Remove($candidate.Identity)
+                    if ($candidate.Identity -notin $consumed -and
+                        (Test-PlaylistShowBeforeCycleFrontier -Roster $nextActive -Consumed $consumed -Identity $candidate.Identity)) {
+                        $consumed += $candidate.Identity
+                    }
                     $retired += [pscustomobject]@{ From = $show.Title; To = $candidate.Title; Round = $number; ManualOverride = $false }
                     continue
                 }

@@ -164,7 +164,11 @@ rules, reports and handoff context are therefore available in this project.
   the entire cycle to be ready before adding its first episode.
   The rotation is 25 active shows, not a 25-show library limit: additional shows
   may wait as replacements. After a show's final queued episode, a replacement
-   can occupy its slot in the next cycle without rewriting already queued items.
+  can occupy its slot in the next cycle without rewriting already queued items.
+  A newly activated show starts at its first local unwatched episode rather than
+  inheriting a stale cursor. If its alphabetical slot is before the saved
+  consumed prefix, defer it until the next cycle to keep the current cycle in
+  alphabetical order.
 - Ordinary movie selection is random, without duplicates. Do not queue the entire
   movie library simply because it is available.
 - Show/movie associations use explicit TMDb IDs in `showMovieLinks`, not title
