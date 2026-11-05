@@ -419,6 +419,22 @@ try {
         }
         if ($moviePlan.Stop) { Add-PlaylistAlert 'movie-shortage' $moviePlan.Stop }
     }
+    Add-PlaylistAlert 'cycle-progress' (Get-PlaylistCycleNotification -CycleNumber $newRounds.NextCycleNumber `
+        -ConsumedCount @($newRounds.CycleConsumed).Count -CycleSize ([int]$script:PlaylistCfg.rotationSize))
+    Add-PlaylistAlert 'episode-download-summary' (Get-PlaylistEpisodeAvailabilitySummary -TvStatus $status -NotChecked:$RecoverOnly)
+    $script:PlaylistAlerts['status-checked-at'] = (Get-Date).ToString('o')
+
+    $alertPath = Join-Path $script:PlaylistData 'notifications.json'
+    $previousAlerts = @{}
+    if (Test-Path -LiteralPath $alertPath) {
+        $oldAlerts = [IO.File]::ReadAllText($alertPath) | ConvertFrom-Json
+        foreach ($p in $oldAlerts.PSObject.Properties) { $previousAlerts[$p.Name] = $p.Value }
+    }
+    foreach ($id in $script:PlaylistAlerts.Keys) {
+        if (-not $previousAlerts.ContainsKey($id) -or $previousAlerts[$id] -ne $script:PlaylistAlerts[$id]) { Write-Warning $script:PlaylistAlerts[$id] }
+    }
+    Write-PlaylistJson -Path $alertPath -Value $script:PlaylistAlerts
+
     if ($RecoverOnly -and -not $state) { throw 'Recovery requires an initialized intended queue. Run a preview/initial apply first.' }
     $desired = @()
     if ($RecoverOnly -or $unresolved.Count) { if ($state) { $desired = @($state.Queue) } }
@@ -529,17 +545,6 @@ try {
         Replacements = $newRounds.Replacements; Alerts = $script:PlaylistAlerts; Verified = $false }
     Write-PlaylistJson -Path (Join-Path $script:PlaylistData 'proposed-state.json') -Value $candidate
     Write-PlaylistJson -Path (Join-Path $script:PlaylistData 'last-result.json') -Value $result
-
-    $alertPath = Join-Path $script:PlaylistData 'notifications.json'
-    $previousAlerts = @{}
-    if (Test-Path -LiteralPath $alertPath) {
-        $oldAlerts = [IO.File]::ReadAllText($alertPath) | ConvertFrom-Json
-        foreach ($p in $oldAlerts.PSObject.Properties) { $previousAlerts[$p.Name] = $p.Value }
-    }
-    foreach ($id in $script:PlaylistAlerts.Keys) {
-        if (-not $previousAlerts.ContainsKey($id) -or $previousAlerts[$id] -ne $script:PlaylistAlerts[$id]) { Write-Warning $script:PlaylistAlerts[$id] }
-    }
-    Write-PlaylistJson -Path $alertPath -Value $script:PlaylistAlerts
 
     if ($Apply) {
         if ($unresolved.Count) { throw 'Unresolved media remains. Notifications saved; existing playlist and intended state retained.' }

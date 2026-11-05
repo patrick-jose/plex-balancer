@@ -143,9 +143,16 @@ function Get-PlaylistNoticeRows {
     foreach ($notice in $Notices.PSObject.Properties) {
         $key = [string]$notice.Name
         $value = [string]$notice.Value
+        if ($key -eq 'status-checked-at') { continue }
         $category = 'INFO'
         $text = $value
-        if ($key -like 'cadence-gap-live-*' -or $key -like 'cadence-gap-intended-*') {
+        if ($key -eq 'cycle-progress') {
+            $category = 'CYCLE'
+        }
+        elseif ($key -eq 'episode-download-summary') {
+            $category = 'CHECK'
+        }
+        elseif ($key -like 'cadence-gap-live-*' -or $key -like 'cadence-gap-intended-*') {
             $category = if ($key -like 'cadence-gap-live-*') { 'ACTION' } else { 'PLAN' }
             if ($value -match 'gap: (\d+) TV episodes between movie #(\d+) ''(.*?)'' and movie #(\d+) ''(.*?)'' \(expected (\d+)\)') {
                 $text = "Cadence $($Matches[1])/$($Matches[6]) episodes (#$($Matches[2]) -> #$($Matches[4])): $($Matches[3]) -> $($Matches[5])"
@@ -440,6 +447,10 @@ function Show-Snapshot {
             $notices = [pscustomobject]@{}
             if (Test-Path -LiteralPath $playlistNoticePath) {
                 $notices = [System.IO.File]::ReadAllText($playlistNoticePath) | ConvertFrom-Json
+            }
+            $statusCheckedAt = Get-Prop $notices 'status-checked-at'
+            if ($statusCheckedAt) {
+                Write-Host ("  Cycle and episode availability checked: {0}" -f $statusCheckedAt) -ForegroundColor DarkGray
             }
             $lastResult = $null
             if (Test-Path -LiteralPath $lastResultPath) { $lastResult = [System.IO.File]::ReadAllText($lastResultPath) | ConvertFrom-Json }

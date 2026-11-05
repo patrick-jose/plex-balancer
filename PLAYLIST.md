@@ -169,6 +169,10 @@ rules, reports and handoff context are therefore available in this project.
   inheriting a stale cursor. If its alphabetical slot is before the saved
   consumed prefix, defer it until the next cycle to keep the current cycle in
   alphabetical order.
+- Playlist notifications state the current cycle number, scheduled slots, and
+  slots remaining to its end. They also summarize aired/released episodes missing
+  locally, explicitly say when none are known missing, and mark the check
+  incomplete when provider status is unavailable.
 - Ordinary movie selection is random, without duplicates. Do not queue the entire
   movie library simply because it is available.
 - Show/movie associations use explicit TMDb IDs in `showMovieLinks`, not title

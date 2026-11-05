@@ -230,6 +230,53 @@ function Test-PlaylistShowBeforeCycleFrontier {
     return ($candidateIndex -ge 0 -and $candidateIndex -lt $frontier)
 }
 
+function Get-PlaylistCycleNotification {
+    param([int]$CycleNumber, [int]$ConsumedCount, [int]$CycleSize = 25)
+    if ($CycleNumber -lt 1 -or $CycleSize -lt 1 -or $ConsumedCount -lt 0 -or $ConsumedCount -gt $CycleSize) {
+        throw 'Invalid playlist cycle progress.'
+    }
+    if ($ConsumedCount -eq $CycleSize) {
+        return "Cycle $CycleNumber is scheduled ($CycleSize/$CycleSize show slots); the next cycle is $($CycleNumber + 1)."
+    }
+    $remaining = $CycleSize - $ConsumedCount
+    return "Cycle ${CycleNumber}: $ConsumedCount/$CycleSize show slots scheduled; $remaining remain until cycle end."
+}
+
+function Get-PlaylistEpisodeAvailabilitySummary {
+    param([hashtable]$TvStatus, [switch]$NotChecked)
+    if ($NotChecked) { return 'Download check not run during recovery-only maintenance.' }
+    if (-not $TvStatus -or $TvStatus.Count -eq 0) { return 'Download check unavailable: no episode status was collected.' }
+    $known = @($TvStatus.Values | Where-Object { $_ -and $_.Known })
+    $unknownCount = $TvStatus.Count - $known.Count
+    $missingCount = 0
+    $affectedShows = 0
+    foreach ($entry in $known) {
+        $count = @(Get-PlaylistProp $entry 'Missing' @()).Count
+        $missingCount += $count
+        if ($count) { $affectedShows++ }
+    }
+    if ($known.Count -eq 0) {
+        $showWord = if ($unknownCount -eq 1) { 'show' } else { 'shows' }
+        return "Download check incomplete: episode availability could not be determined for $unknownCount $showWord; no conclusion about missing downloads is possible."
+    }
+    if ($missingCount) {
+        $episodeWord = if ($missingCount -eq 1) { 'episode is' } else { 'episodes are' }
+        $showWord = if ($affectedShows -eq 1) { 'show' } else { 'shows' }
+        $text = "Download check: $missingCount aired/released $episodeWord missing locally across $affectedShows $showWord; they may be available to download."
+        if ($unknownCount) {
+            $unknownShowWord = if ($unknownCount -eq 1) { 'show' } else { 'shows' }
+            $text += " Status is unavailable for another $unknownCount $unknownShowWord."
+        }
+        return $text
+    }
+    if ($unknownCount) {
+        $checkedShowWord = if ($known.Count -eq 1) { 'show' } else { 'shows' }
+        $unknownShowWord = if ($unknownCount -eq 1) { 'show' } else { 'shows' }
+        return "Download check incomplete: no known aired/released episodes are missing locally across $($known.Count) checked $checkedShowWord; status is unavailable for $unknownCount $unknownShowWord."
+    }
+    return "Download check: no known aired/released episodes are missing locally across $($known.Count) checked shows."
+}
+
 function Get-PlaylistRounds {
     param([object[]]$Shows, [object[]]$Episodes, [object[]]$Original, [object[]]$Replacements,
         [hashtable]$TvStatus, [int]$Count = 25, [int]$StartRound = 1, [hashtable]$Cursors = @{}, [string[]]$ActiveIds = @(),

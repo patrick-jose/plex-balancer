@@ -6,6 +6,14 @@ $sampleNotices = [pscustomobject]@{
     'cadence-gap-live-a-b' = "Managed live playlist cadence gap: 4 TV episodes between movie #139 'Movie A' and movie #144 'Movie B' (expected 5). Review the managed order; no source-playlist or media changes were made."
     'cycle-paused' = 'Cycle 6 paused: only 24 of 25 active shows have eligible downloaded unwatched episodes; blocked: VisionQuest: no next local episode; update content or verify series status; no partial cycle queued.'
 }
+$statusRows = @(Get-PlaylistNoticeRows ([pscustomobject]@{
+    'cycle-progress' = 'Cycle 8: 11/25 show slots scheduled; 14 remain until cycle end.'
+    'episode-download-summary' = 'Download check: no known aired/released episodes are missing locally across 25 checked shows.'
+    'status-checked-at' = '2026-11-04T20:00:00-03:00'
+}))
+Assert-Equal 'cycle progress is rendered in the cycle category' (@($statusRows | Where-Object Category -eq 'CYCLE').Count) 1
+Assert-Equal 'episode availability is rendered as a check, including the no-missing case' (@($statusRows | Where-Object { $_.Category -eq 'CHECK' -and $_.Text -match 'no known aired/released episodes are missing locally' }).Count) 1
+Assert-Equal 'status timestamp is metadata and does not render as a notification' (@($statusRows | Where-Object Text -match '2026-11-04T20:00:00').Count) 0
 $noticeRows = @(Get-PlaylistNoticeRows $sampleNotices)
 Assert-Equal 'playlist actions sort ahead of informational notices' $noticeRows[0].Category 'ACTION'
 Assert-Equal 'cadence notice is compacted with positions and movie boundary' $noticeRows[0].Text 'Cadence 4/5 episodes (#139 -> #144): Movie A -> Movie B'

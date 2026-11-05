@@ -2,9 +2,32 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_helpers.ps1')
 . (Join-Path $script:TestRoot 'playlist-lib.ps1')
 
+$cycleNotice = Get-PlaylistCycleNotification -CycleNumber 8 -ConsumedCount 11
+Assert-Equal 'cycle notification shows scheduled and remaining slots to the cycle end' $cycleNotice 'Cycle 8: 11/25 show slots scheduled; 14 remain until cycle end.'
+Assert-Equal 'fully scheduled cycle notification names the next cycle' (Get-PlaylistCycleNotification -CycleNumber 8 -ConsumedCount 25) 'Cycle 8 is scheduled (25/25 show slots); the next cycle is 9.'
+$noMissingAvailability = @{}
+$noMissingAvailability['show-a'] = [pscustomobject]@{ Known=$true; Missing=@() }
+$noMissingAvailability['show-b'] = [pscustomobject]@{ Known=$true; Missing=@() }
+Assert-Equal 'download summary explicitly reports when no aired episodes are missing' `
+    (Get-PlaylistEpisodeAvailabilitySummary -TvStatus $noMissingAvailability) `
+    'Download check: no known aired/released episodes are missing locally across 2 checked shows.'
+$missingAvailability = @{ 'show-a' = [pscustomobject]@{ Known=$true; Missing=@([pscustomobject]@{Season=1;Episode=2},[pscustomobject]@{Season=1;Episode=3}) } }
+Assert-Equal 'download summary counts potentially downloadable missing episodes' `
+    (Get-PlaylistEpisodeAvailabilitySummary -TvStatus $missingAvailability) `
+    'Download check: 2 aired/released episodes are missing locally across 1 show; they may be available to download.'
+$partialAvailability = @{ 'show-a' = [pscustomobject]@{ Known=$true; Missing=@() }; 'show-b' = [pscustomobject]@{ Known=$false; Missing=@() } }
+Assert-Equal 'download summary does not claim completeness when provider status is unknown' `
+    (Get-PlaylistEpisodeAvailabilitySummary -TvStatus $partialAvailability) `
+    'Download check incomplete: no known aired/released episodes are missing locally across 1 checked show; status is unavailable for 1 show.'
+Assert-Equal 'recovery-only run explicitly says episode availability was not checked' `
+    (Get-PlaylistEpisodeAvailabilitySummary -TvStatus @{} -NotChecked) `
+    'Download check not run during recovery-only maintenance.'
+
 $managerSource = [IO.File]::ReadAllText((Join-Path $script:TestRoot 'playlist-manager.ps1'))
 Assert-False 'manual managed-playlist edits do not block manager applies' ($managerSource -match 'Manual playlist edits detected|AcceptManualOrder')
 Assert-True 'every proposal is checked against saved managed items before synchronization' ($managerSource -match 'Assert-PlaylistBaseQueuePreserved -BaseQueue')
+Assert-True 'cycle and download status are persisted before continuation can fail' `
+    ($managerSource.IndexOf("Add-PlaylistAlert 'episode-download-summary'", [StringComparison]::Ordinal) -lt $managerSource.IndexOf('Merge-PlaylistContinuation -BaseQueue', [StringComparison]::Ordinal))
 $missingMediaBlock = Get-SourceBetween -Script 'playlist-manager.ps1' -Start 'if ($found) { $recovered += $found }' -End '$episodes = @($library | Where-Object Type -eq ''episode'')'
 Assert-False 'missing library media cannot silently delete its saved movie slot' ($missingMediaBlock -match 'Remove-PlaylistMovieSlot|deleted-managed-movie-')
 $initialResult = [pscustomobject]@{ DesiredCount=244; RemovesFromCopy=3; Movies=75 }
