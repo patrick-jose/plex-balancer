@@ -4,6 +4,9 @@ Playlist management is documented separately in [PLAYLIST.md](PLAYLIST.md).
 `playlist-manager.ps1` previews by default; `-Apply` maintains only the managed
 copy, with durable queue/recovery state in the private `playlist-data\` folder.
 When enabled locally, the hourly watcher runs it after storage maintenance.
+With `cadenceBackfill` enabled, `-Apply` also refills short TV blocks left by
+deleted shows from eligible downloaded episodes (see [PLAYLIST.md](PLAYLIST.md));
+preview only reports the fills and never edits the live playlist.
 
 Every command for the toolset in `%USERPROFILE%\plex-balancer`.
 
@@ -791,7 +794,59 @@ Note: `moves-20261003.jsonl` contains `move_failed` entries from an early failed
 run. The log is append-only by design, so those lines stay as a record. They do
 not indicate a current problem - check the timestamps.
 
+### Storage history
+
+`logs\` is pruned after `logRetentionDays`, so it cannot answer "where was this
+episode last week, and who removed it". `storage-history\` does: it is a durable,
+append-only ledger of every media path the balancer has seen. It is read-only on
+the library and never moves, renames or deletes media. It only writes under
+`storage-history\`:
+
+| File | What it holds |
+| --- | --- |
+| `index.json` | current state per path: size, mtime, first/last seen, `Present` or `Missing`, plus per-root health |
+| `events-YYYYMM.jsonl` | one line per `appeared`, `changed`, `moved`, `vanished`, `reappeared`, `retired`, `move_failed`, `root-offline/partial/online` |
+| `ingest.json` | how far each `moves-*.jsonl` and `retirement-*.json` was already read |
+
+The watcher runs a scan after playlist maintenance, at most once every
+`storageHistoryIntervalMinutes` (default 60). Set `storageHistoryEnabled` to
+`false` to switch it off. A scan failure is logged as a warning and never delays
+or fails the balance and playlist work.
+
+A disappearance is inferred, not witnessed: the file was present at the last
+clean scan and is absent at this one. Two things never count as evidence:
+
+- **an offline root** - an unplugged USB disk is not a deleted file. It records a
+  `root-offline` event and leaves every file under it alone.
+- **a partial root** - a folder that failed to enumerate during the walk. It
+  records `root-partial` and skips absence checks for that root rather than
+  guessing at the files it could not read.
+
+A path that vanishes while a file with the same name and size appears elsewhere
+within 48 hours is recorded as `moved`, keeping its original first-seen date. That
+is how the balancer's own copy and cascade looks from the outside.
+
+```powershell
+# one scan now, ignoring the configured interval
+.\storage-history.ps1 -MinIntervalMinutes 0
+
+# what happened to a file, show or episode
+.\storage-history.ps1 -Report 'Lanterns'
+.\storage-history.ps1 -Report 'S04E10'
+
+# only import balancer move failures and retirement records
+.\storage-history.ps1 -IngestOnly
+
+# look without writing
+.\storage-history.ps1 -DryRun
+```
+
+The script tests live in `tests\storage-history.ps1`; they pin the five
+transitions, offline/partial suppression, the 48 hour move window and the
+append-only ingest offsets.
+
 ### The download guard
+
 
 A file is held while qBittorrent still lists the torrent that owns it. It replaced
 a rule that was purely time-based - anything modified in the last
@@ -1117,6 +1172,33 @@ Honest list of what is incomplete or worth knowing:
   library shows up as a delete plus an add. Watch status or manual edits on a
   moved title may reset; the same filename re-matches, but playback history does
   not necessarily come back.
+- **A movie you removed by hand is replaced, not re-added.** While a movie stays
+  in `state.Movies` but is absent from the managed playlist, the manager reads
+  that as a manual removal and fills the slot with a random movie chosen by
+  franchise order. That is intended for a removal you meant to keep. To put such
+  a movie back, insert it into `state.Queue`, `state.BaseQueue` and `state.Movies`
+  **and** add it to the live managed playlist before the next run; then
+  `-Apply -RecoverOnly` moves it to its saved position. Running the manager with
+  the movie only in the saved state produces the random replacement instead, and
+  the removed movie does not come back.
+- **Replacing a media file can drop its playlist entry.** When a better copy
+  replaces an episode or film, Plex may treat it as a new library item (a new
+  ratingKey); the managed playlist entry then disappears even though the state
+  still holds it and a verify just passed. The manager now matches by stable
+  identity and persists the new ratingKey into `Queue`, `BaseQueue` and `Movies`,
+  so the next `-Apply -RecoverOnly` adds it back at the saved position and the
+  ledger records the old path as `vanished` and the new one as `appeared`. Check
+  the playlist after any quality upgrade.
+- **Truly missing media is deferred, not a permanent write blocker.** After a
+  section refresh, a saved item with no Plex identity match is moved to
+  `state.Missing` with its slot number, written to `LIBRARY-MISSING-DETAILS.md`, and
+  left out of the managed copy until it returns. The rest of the queue keeps syncing.
+  The short download checklist `LIBRARY-MISSING.md` is refreshed on every normal run.
+  On a later run, once Plex lists that identity again, the item is restored to
+  its saved slot and the ledger row moves to resolved history. An ambiguous match
+  (two library items with the same identity) still pauses writes by design.
+  Preview runs never modify the ledger; only `-Apply` does. The ledger location
+  comes from `missingMediaLedgerPath` in `playlist.config.json`.
 - **A file can be moved out from under Plex mid-scan.** `Test-UnitLocked` opens
   the unit with `FileShare::None`, so a file Plex holds *at that instant* is
   skipped. But the check guards a moment, not the copy: an 11 GB file copied from

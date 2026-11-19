@@ -126,8 +126,31 @@ Assert-Equal 'numeric episode ordering' $plan.Rounds[0].Episodes[0].Episode 1
 Assert-Equal 'next round advances each show' $plan.Rounds[1].Episodes[0].Episode 2
 Assert-Equal 'round has 25 distinct shows' @($plan.Rounds[0].Episodes.ShowKey|Select-Object -Unique).Count 25
 $only24 = Get-PlaylistRounds -Shows @($shows | Select-Object -First 24) -Episodes $episodes -Original @() -Replacements @() -TvStatus @{}
-Assert-Equal '24 active shows stop the cycle instead of creating a short round' @($only24.Rounds).Count 0
-Assert-True '24-show stop is explained in the planner result' ($only24.Stop[0] -match 'only 24 active shows')
+Assert-Equal '24 active shows still queue a usable round instead of pausing' @($only24.Rounds).Count 1
+Assert-Equal 'a 24-show round queues all 24 available episodes' @($only24.Rounds[0].Episodes).Count 24
+Assert-True '24-show stop explains the cycle ended short of 25 slots' ($only24.Stop[0] -match 'queued 24 of 25 show slots')
+
+# A saved active show deleted from Plex (the whole series) is a
+# roster vacancy, not a reason to pause every future cycle. It must be dropped
+# and an eligible downloaded standby promoted so the 25-show shape is kept.
+$deadActiveId = 'plex://show/deleted-from-plex'
+$first24Ids = @($shows | Select-Object -First 24 | ForEach-Object Identity)
+$withPromotableStandby = Get-PlaylistRounds -Shows $shows -Episodes $episodes -Original @() -Replacements @() -TvStatus @{} -ActiveIds @($first24Ids + $deadActiveId)
+Assert-Equal 'deleted active show is replaced by an eligible standby to keep the 25-show roster' @($withPromotableStandby.ActiveIds).Count 25
+Assert-False 'deleted show id is dropped from the active roster' ($deadActiveId -in $withPromotableStandby.ActiveIds)
+Assert-True 'downloaded standby is promoted into the vacant slot' ('show25' -in $withPromotableStandby.ActiveIds)
+Assert-Equal 'roster vacancy promotion is recorded as a replacement' $withPromotableStandby.Replacements[0].From 'deleted active show'
+Assert-Equal 'promoted standby is named in the replacement notice' $withPromotableStandby.Replacements[0].To 'show25'
+Assert-Equal 'full rounds still form after the deleted show is replaced' @($withPromotableStandby.Rounds).Count 3
+
+# When no standby has downloaded content, rotation continues with the survivors
+# and stops at the short cycle instead of hard-pausing on the missing show.
+$noStandby = Get-PlaylistRounds -Shows @($shows | Select-Object -First 24) -Episodes $episodes -Original @() -Replacements @() -TvStatus @{} -ActiveIds @($first24Ids + $deadActiveId) -CycleConsumed @('show01', $deadActiveId)
+Assert-Equal 'deleted show without a standby keeps the surviving active roster' @($noStandby.ActiveIds).Count 24
+Assert-False 'deleted show id is not retained when no standby is available' ($deadActiveId -in $noStandby.ActiveIds)
+Assert-False 'deleted show id is removed from the consumed cycle prefix' ($deadActiveId -in $noStandby.CycleConsumed)
+Assert-Equal 'surviving shows still queue a usable round' @($noStandby.Rounds).Count 1
+Assert-True 'short cycle explains the missing slot without a hard pause' ($noStandby.Stop[0] -match 'queued 24 of 25 show slots')
 
 $standby = Media 'show26' 'show'
 $short = @($episodes | Where-Object { $_.ShowKey -ne 'show01' -or $_.Episode -eq 1 })
@@ -237,7 +260,7 @@ Assert-False 'alphabetically earlier replacement does not break the consumed cyc
 Assert-Equal 'earlier replacement joins at the next cycle boundary' $darkMatterPlan.Rounds[1].Episodes[0].ShowKey 'dark-matter'
 Assert-Equal 'newly activated show ignores its stale later-season cursor' $darkMatterPlan.Rounds[1].Episodes[0].Identity 'darkmatter-s1e1'
 
-$rotationNames = @('The Bear','Castle Rock','Curb Your Enthusiasm','Doctor Who','Euphoria','From','Hacks','House of the Dragon','Impuros',"It's Always Sunny in Philadelphia",'Jury Duty','Lanterns','Louis Theroux: Life on the Edge','Modern Family','New Bandits','Parks and Recreation','Penn & Teller: Fool Us','The Simpsons','The Sopranos','South Park','Spider-Noir','Star Wars: The Clone Wars','Ted Lasso',"Widow's Bay",'X-Men')
+$rotationNames = @('The Bear','Castle Rock','Curb Your Enthusiasm','Doctor Who','Euphoria','Fable','Hacks','House of the Dragon','Impuros',"It's Always Sunny in Philadelphia",'Jurassic World','Lanterns','Louis Theroux: Life on the Edge','Modern Family','New Bandits','Parks and Recreation','Penn & Teller: Fool Us','The Simpsons','The Sopranos','South Park','Spider-Noir','Star Wars: The Clone Wars','Ted Lasso',"Widow's Bay",'X-Men')
 $repairShows = @($rotationNames | ForEach-Object { $s=Media $_ 'show'; if($s.Title -eq 'The Bear'){$s.SortTitle='Bear'}; $s })
 $repairQueue = @(); $repairTv = 0; $repairMovie = 0
 for($cycle=1;$cycle -le 2;$cycle++) {
@@ -399,6 +422,75 @@ Assert-Equal 'movie-only reserve tail does not create false cadence gaps' @(Get-
 $fullCadence = @((Media 'full-movie-a')) + @(1..5 | ForEach-Object { Media ("full-episode-$_") 'episode' $_ 'show01' }) + @((Media 'full-movie-b'),(Media 'full-after-b' 'episode' 6 'show01'))
 $fullCadenceGaps = @(Get-PlaylistCadenceGaps -Queue $fullCadence -EpisodesPerMovie 5)
 Assert-Equal 'five-episode movie interval is accepted' $fullCadenceGaps.Count 0
+
+$bfShows = @(
+    [pscustomobject]@{ Identity='bf-show-a'; Key='bf-key-a'; SortTitle='A'; Title='Show A' },
+    [pscustomobject]@{ Identity='bf-show-b'; Key='bf-key-b'; SortTitle='B'; Title='Show B' },
+    [pscustomobject]@{ Identity='bf-show-c'; Key='bf-key-c'; SortTitle='C'; Title='Show C' }
+)
+$bfQueue = @( (Media 'bf-movie-1'),
+    (Media 'bf-a-1' 'episode' 1 'bf-key-a'),(Media 'bf-b-1' 'episode' 1 'bf-key-b'),
+    (Media 'bf-a-2' 'episode' 2 'bf-key-a'),(Media 'bf-b-2' 'episode' 2 'bf-key-b'),
+    (Media 'bf-movie-2'),(Media 'bf-tail' 'episode' 9 'bf-key-c') )
+$bfEpisodes = @( (Media 'bf-c-1' 'episode' 1 'bf-key-c'),(Media 'bf-c-2' 'episode' 2 'bf-key-c'),
+    (Media 'bf-a-3' 'episode' 3 'bf-key-a') )
+$bf = Fill-PlaylistCadenceGaps -Queue $bfQueue -Shows $bfShows -Episodes $bfEpisodes -ActiveIds @('bf-show-a','bf-show-b','bf-show-c')
+Assert-Equal 'backfill fills a short TV block' @($bf.Filled).Count 1
+Assert-Equal 'backfill inserts exactly one entry' @($bf.Queue).Count (@($bfQueue).Count + 1)
+Assert-Equal 'backfill places the episode before the following movie' $bf.Queue[5].Identity 'bf-c-1'
+Assert-Equal 'backfill preserves the relative order of every existing item' `
+    ((@($bf.Queue | Where-Object { $_.Identity -ne 'bf-c-1' }).Identity) -join ',') ((@($bfQueue).Identity) -join ',')
+Assert-Equal 'backfill removes the cadence gap' @(Get-PlaylistCadenceGaps -Queue $bf.Queue -EpisodesPerMovie 5).Count 0
+Assert-Equal 'backfill names the show that supplied the episode' $bf.Filled[0].Show.Title 'Show C'
+$bfNone = Fill-PlaylistCadenceGaps -Queue $bfQueue -Shows $bfShows -Episodes @() -ActiveIds @('bf-show-a','bf-show-b','bf-show-c')
+Assert-Equal 'backfill leaves a gap unsolved when no episode is available' @($bfNone.Filled).Count 0
+Assert-Equal 'backfill reports the unsolved gap' @($bfNone.Unfilled).Count 1
+Assert-Equal 'backfill never changes the queue when it cannot fill' ((@($bfNone.Queue).Identity) -join ',') ((@($bfQueue).Identity) -join ',')
+$bfCursor = Fill-PlaylistCadenceGaps -Queue $bfQueue -Shows $bfShows -Episodes $bfEpisodes -Cursors @{ 'bf-show-c' = 10001 } -ActiveIds @('bf-show-a','bf-show-b','bf-show-c')
+Assert-Equal 'backfill respects the saved cursor instead of reusing an older episode' $bfCursor.Queue[5].Identity 'bf-c-2'
+$bfDuplicate = Fill-PlaylistCadenceGaps -Queue $bfQueue -Shows $bfShows -Episodes $bfEpisodes -ActiveIds @('bf-show-a','bf-show-b')
+Assert-Equal 'backfill never gives one block two episodes of the same show' @($bfDuplicate.Filled).Count 0
+$bfFullQueue = @( (Media 'bf-full-movie-1'),
+    (Media 'bf-full-a-1' 'episode' 1 'bf-key-a'),(Media 'bf-full-b-1' 'episode' 1 'bf-key-b'),
+    (Media 'bf-full-a-2' 'episode' 2 'bf-key-a'),(Media 'bf-full-b-2' 'episode' 2 'bf-key-b'),
+    (Media 'bf-full-c-1' 'episode' 1 'bf-key-c'),(Media 'bf-full-movie-2') )
+$bfFull = Fill-PlaylistCadenceGaps -Queue $bfFullQueue -Shows $bfShows -Episodes $bfEpisodes -ActiveIds @('bf-show-a','bf-show-b','bf-show-c')
+Assert-Equal 'backfill leaves a complete five-episode block untouched' @($bfFull.Filled).Count 0
+
+$bfCycleShows = @(
+    [pscustomobject]@{ Identity='bfc-a'; Key='bfck-a'; SortTitle='A'; Title='A' },
+    [pscustomobject]@{ Identity='bfc-b'; Key='bfck-b'; SortTitle='B'; Title='B' },
+    [pscustomobject]@{ Identity='bfc-c'; Key='bfck-c'; SortTitle='C'; Title='C' },
+    [pscustomobject]@{ Identity='bfc-d'; Key='bfck-d'; SortTitle='D'; Title='D' },
+    [pscustomobject]@{ Identity='bfc-e'; Key='bfck-e'; SortTitle='E'; Title='E' }
+)
+$bfCycleQueue = @( (Media 'bfc-m1'),
+    (Media 'bfc-a1' 'episode' 1 'bfck-a'),(Media 'bfc-b1' 'episode' 1 'bfck-b'),
+    (Media 'bfc-d1' 'episode' 1 'bfck-d'),(Media 'bfc-e1' 'episode' 1 'bfck-e'),
+    (Media 'bfc-m2'),(Media 'bfc-a2' 'episode' 2 'bfck-a'),
+    (Media 'bfc-m3'),(Media 'bfc-b2' 'episode' 2 'bfck-b'),
+    (Media 'bfc-m4'),(Media 'bfc-d2' 'episode' 2 'bfck-d'),
+    (Media 'bfc-m5'),(Media 'bfc-e2' 'episode' 2 'bfck-e') )
+$bfCycleEpisodes = @((Media 'bfc-c1' 'episode' 1 'bfck-c'))
+$bfCycle = Fill-PlaylistCadenceGaps -Queue $bfCycleQueue -Shows $bfCycleShows -Episodes $bfCycleEpisodes -ActiveIds @('bfc-a','bfc-b','bfc-c','bfc-d','bfc-e')
+Assert-Equal 'cycle-aware backfill fills the short block' @($bfCycle.Filled).Count 1
+Assert-Equal 'cycle-aware backfill inserts the missing show in alphabetical position' $bfCycle.Queue[3].Identity 'bfc-c1'
+Assert-Equal 'cycle-aware backfill never repeats a show already used in the cycle' @(@($bfCycle.Queue | Where-Object { $_.ShowKey -eq 'bfck-c' })).Count 1
+
+$bfOrderShows = @(
+    [pscustomobject]@{ Identity='bfo-a'; Key='bfok-a'; SortTitle='A'; Title='A' },
+    [pscustomobject]@{ Identity='bfo-b'; Key='bfok-b'; SortTitle='B'; Title='B' },
+    [pscustomobject]@{ Identity='bfo-c'; Key='bfok-c'; SortTitle='C'; Title='C' }
+)
+$bfOrderQueue = @( (Media 'bfo-m1'),
+    (Media 'bfo-a1' 'episode' 1 'bfok-a'),(Media 'bfo-b1' 'episode' 1 'bfok-b'),
+    (Media 'bfo-a2' 'episode' 2 'bfok-a'),(Media 'bfo-b2' 'episode' 2 'bfok-b'),
+    (Media 'bfo-m2'),(Media 'bfo-c1' 'episode' 1 'bfok-c'),(Media 'bfo-m3') )
+$bfOrderEpisodes = @((Media 'bfo-c2' 'episode' 2 'bfok-c'))
+$bfOrder = Fill-PlaylistCadenceGaps -Queue $bfOrderQueue -Shows $bfOrderShows -Episodes $bfOrderEpisodes -ActiveIds @('bfo-a','bfo-b','bfo-c')
+Assert-Equal 'backfill never puts a later episode ahead of an earlier queued episode of the same show' @($bfOrder.Filled).Count 0
+Assert-Equal 'backfill leaves the queue untouched when the only standby would invert its episode order' ((@($bfOrder.Queue).Identity) -join ',') ((@($bfOrderQueue).Identity) -join ',')
+
 $ops = @(Get-PlaylistSyncOperations -Desired $movies[0..2] -Current @($movies[0],$movies[3]))
 Assert-Equal 'sync adds only missing items' @($ops|Where-Object Kind -eq 'add').Count 2
 Assert-Equal 'sync removes unwanted references, not files' @($ops|Where-Object Kind -eq 'remove').Count 1
@@ -448,6 +540,14 @@ function Get-PlaylistMetadata {
             [pscustomobject]@{season_number=1;episode_number=3;air_date='2099-01-03'}
         ) }
     }
+    if ($Path -eq 'tv/98') { return [pscustomobject]@{ status='Ended'; seasons=@([pscustomobject]@{season_number=1}) } }
+    if ($Path -eq 'tv/98/season/1') {
+        return [pscustomobject]@{ episodes=@(
+            [pscustomobject]@{season_number=1;episode_number=1;air_date='2000-01-01';id=981},
+            [pscustomobject]@{season_number=1;episode_number=2;air_date='2000-01-02';id=982},
+            [pscustomobject]@{season_number=1;episode_number=3;air_date='2000-01-03';id=983}
+        ) }
+    }
     throw 'Unexpected fake metadata request.'
 }
 $providerShow = Media 'provider-show' 'show'; $providerShow.Ids += 'tmdb://99'
@@ -460,6 +560,17 @@ Assert-Equal 'released missing episode is identified' $tv.Missing[0].Episode 2
 Assert-Equal 'unaired future episode is not a missing-download notice' @($tv.Missing).Count 1
 Assert-Equal 'next release date is available for notification' $tv.NextAirDate '2099-01-03'
 Assert-Equal 'final episode includes future scheduled finale' $tv.Final 10003
+
+# The download list must not inherit the rotation-cursor filter used for retirement.
+$behindShow = Media 'behind-show' 'show'; $behindShow.Ids += 'tmdb://98'
+$behindLocal = Media 'behind-episode' 'episode' 3 $behindShow.Key
+$tvBehind = Get-PlaylistTvStatus $behindShow @($behindLocal) 10003 10001
+Assert-Equal 'retirement check ignores episodes behind the cursor' @($tvBehind.Missing).Count 0
+Assert-Equal 'download check keeps aired episodes behind the cursor' @($tvBehind.DownloadMissing).Count 2
+Assert-Equal 'behind-cursor download episodes keep their episode number' $tvBehind.DownloadMissing[0].Episode 1
+$tvWatched = Get-PlaylistTvStatus $behindShow @($behindLocal) 10003 10001 @('tmdb://982')
+Assert-Equal 'watched episode is not offered for download again' @($tvWatched.DownloadMissing).Count 1
+Assert-Equal 'unwatched behind-cursor episode remains downloadable' $tvWatched.DownloadMissing[0].Episode 1
 $script:MetadataFails = $true
 $tv = Get-PlaylistTvStatus $providerShow @($localEpisode) 10001
 Assert-False 'provider failure never fabricates an ended decision' $tv.Ended
@@ -539,4 +650,159 @@ try {
     Assert-Equal 'state writer leaves no temporary files' @(Get-ChildItem $tmp -Filter '*.tmp').Count 0
 }
 finally { if(Test-Path $tmp){ Remove-Item -LiteralPath $tmp -Recurse -Force } }
+
+# Durable missing-media handling: identity rebind, deferral, ledger, restoration.
+$rebindOld = Media 'rebind-old' 'episode' 3 'rebind-show'
+$rebindNew = Media 'rebind-new' 'episode' 3 'rebind-show'; $rebindNew.Ids = @($rebindOld.Ids); $rebindNew.Key = '4536'
+Assert-Equal 'stable identity finds a re-keyed item even when ratingKey changed' @(Get-PlaylistMediaMatches -Wanted $rebindOld -Library @($rebindNew)).Count 1
+Assert-Equal 'identity matches expose the current ratingKey' @(Get-PlaylistMediaMatches -Wanted $rebindOld -Library @($rebindNew))[0].Key '4536'
+$deferItem = Media 'defer-item' 'episode' 4 'defer-show'; $deferItem.Title = 'VisionQuest'
+$deferEntry = New-PlaylistMissingEntry -Item $deferItem -Position 41
+Assert-Equal 'deferred item retains its identity' $deferEntry.Identity 'defer-item'
+Assert-Equal 'deferred item retains its saved zero-based slot' $deferEntry.Position 41
+Assert-True 'deferred item records when it was first seen' ([bool]$deferEntry.FirstSeen)
+$insertBase = @((Media 'insert-a'),(Media 'insert-b'),(Media 'insert-c'))
+Assert-Equal 'queue insert places an item at the start' ((Insert-PlaylistQueueItem -Queue $insertBase -Position 0 -Item (Media 'insert-first')).Identity -join ',') 'insert-first,insert-a,insert-b,insert-c'
+Assert-Equal 'queue insert places an item in the middle' ((Insert-PlaylistQueueItem -Queue $insertBase -Position 2 -Item (Media 'insert-mid')).Identity -join ',') 'insert-a,insert-b,insert-mid,insert-c'
+Assert-Equal 'queue insert appends beyond the tail' ((Insert-PlaylistQueueItem -Queue $insertBase -Position 9 -Item (Media 'insert-last')).Identity -join ',') 'insert-a,insert-b,insert-c,insert-last'
+
+$ledgerTmp = Join-Path ([IO.Path]::GetTempPath()) ('missing-ledger-test-' + [guid]::NewGuid().ToString('N') + '.md')
+try {
+    [IO.File]::WriteAllText($ledgerTmp, "# Library: episodes missing locally`n`n- **Last updated:** 2026-11-17 06:50 -03:00`n- **Source of truth:** keep me too.`n`nProse that must survive, including from jury duty.`n")
+    Update-PlaylistMissingLedger -Path $ledgerTmp -Missing @($deferEntry) -History @() | Out-Null
+    $ledgerText = [IO.File]::ReadAllText($ledgerTmp)
+    Assert-True 'ledger preserves unrelated prose' ($ledgerText -match 'Prose that must survive, including from jury duty.')
+    Assert-True 'ledger preserves neighbouring metadata lines' ($ledgerText -match '(?m)^- \*\*Source of truth:\*\* keep me too\.$')
+    $updatedLine = [regex]::Match($ledgerText, '(?m)^- \*\*Last updated:\*\*[^\r\n]*$').Value
+    Assert-True 'ledger rewrites a stale Last updated header with a fresh timestamp' ($updatedLine -match '20\d\d-\d\d-\d\d \d\d:\d\d [+-]\d\d:\d\d' -and $updatedLine -notmatch '2026-11-17')
+    Assert-True 'ledger lists a deferred episode with its show' ($ledgerText -match '\| defer-show \| S01E04 VisionQuest \|')
+    Assert-True 'ledger records the saved one-based slot' ($ledgerText -match '\| #42 \|')
+    $resolvedEntry = [pscustomobject]@{ Identity=$deferEntry.Identity; Show=$deferEntry.Show; Title=$deferEntry.Title
+        Season=$deferEntry.Season; Episode=$deferEntry.Episode; Type=$deferEntry.Type
+        FirstSeen=$deferEntry.FirstSeen; ResolvedAt=(Get-Date).ToString('o'); How='Plex library item reappeared after refresh' }
+    Update-PlaylistMissingLedger -Path $ledgerTmp -Missing @() -History @($resolvedEntry) | Out-Null
+    $resolvedText = [IO.File]::ReadAllText($ledgerTmp)
+    Assert-True 'resolved ledger rows move to history instead of disappearing' ($resolvedText -match '### Auto-tracked resolved media')
+    Assert-True 'resolved row keeps the reappearance explanation' ($resolvedText -match 'Plex library item reappeared after refresh')
+    Assert-Equal 'ledger never duplicates its managed block' ([regex]::Matches($resolvedText, '<!-- playlist-manager:missing:start -->').Count) 1
+    Update-PlaylistMissingLedger -Path $ledgerTmp -Missing @() -History @($resolvedEntry) | Out-Null
+    Assert-Equal 'ledger updates are idempotent' ([regex]::Matches([IO.File]::ReadAllText($ledgerTmp), '<!-- playlist-manager:missing:start -->').Count) 1
+}
+finally { if (Test-Path -LiteralPath $ledgerTmp) { Remove-Item -LiteralPath $ledgerTmp -Force } }
+
+$downloadTmp = Join-Path ([IO.Path]::GetTempPath()) ('download-list-test-' + [guid]::NewGuid().ToString('N') + '.md')
+try {
+    $dlItems = @(
+        [pscustomobject]@{ Show='Zeta Show'; Season=2; Episode=10; AirDate='2026-11-17' },
+        [pscustomobject]@{ Show='Alpha Show'; Season=1; Episode=4; AirDate='' },
+        [pscustomobject]@{ Show='Zeta Show'; Season=2; Episode=11; AirDate='2026-11-18' }
+    )
+    Write-PlaylistDownloadList -Path $downloadTmp -DownloadItems $dlItems
+    $dlText = [IO.File]::ReadAllText($downloadTmp)
+    Assert-True 'download list is a short checkbox checklist' ($dlText -match '(?m)^- \[ \] Alpha Show - S01E04$')
+    Assert-True 'download list includes the air date when known' ($dlText -match '\(aired 2026-11-17\)')
+    Assert-True 'download list sorts by show then episode' ($dlText.IndexOf('Alpha Show') -lt $dlText.IndexOf('Zeta Show') -and $dlText.IndexOf('S02E10') -lt $dlText.IndexOf('S02E11'))
+    Assert-True 'download list counts episodes and shows' ($dlText -match '3 episodes across 2 shows')
+    Assert-True 'download list points at the detail archive' ($dlText -match 'LIBRARY-MISSING-DETAILS\.md')
+    Assert-True 'download list says watched episodes are excluded' ($dlText -match 'Watched episodes are excluded\.')
+    Write-PlaylistDownloadList -Path $downloadTmp -DownloadItems @()
+    Assert-True 'empty download list says nothing to download' ([IO.File]::ReadAllText($downloadTmp) -match 'Nothing to download\.')
+}
+finally { if (Test-Path -LiteralPath $downloadTmp) { Remove-Item -LiteralPath $downloadTmp -Force } }
+
+$lostTmp = Join-Path ([IO.Path]::GetTempPath()) ('destroyed-media-test-' + [guid]::NewGuid().ToString('N'))
+try {
+    $logDir = Join-Path $lostTmp 'logs'
+    $seasonDir = Join-Path $lostTmp 'Show A\Season 1'
+    [void][IO.Directory]::CreateDirectory($logDir)
+    [void][IO.Directory]::CreateDirectory($seasonDir)
+    $gonePath = Join-Path $seasonDir 'Show.A.S01E03.mkv'
+    $keptPath = Join-Path $seasonDir 'Show.A.S01E04.mkv'
+    [IO.File]::WriteAllText($keptPath, 'x')
+    $logLines = @(
+        ([pscustomobject]@{ event='recycle_destroyed'; from=$gonePath; name='Show.A.S01E03.mkv' } | ConvertTo-Json -Compress),
+        ([pscustomobject]@{ event='recycle_destroyed'; from=$gonePath; name='Show.A.S01E03.mkv' } | ConvertTo-Json -Compress),
+        ([pscustomobject]@{ event='recycle_destroyed'; from=$keptPath; name='Show.A.S01E04.mkv' } | ConvertTo-Json -Compress),
+        ([pscustomobject]@{ event='moved'; from=$gonePath; name='Show.A.S01E05.mkv' } | ConvertTo-Json -Compress)
+    )
+    [IO.File]::WriteAllLines((Join-Path $logDir 'moves-20261118.jsonl'), $logLines)
+    $detected = @(Get-PlaylistDestroyedMedia -LogDirectory $logDir -Library @())
+    Assert-Equal 'destroyed-media detector finds a purge whose file is gone' $detected.Count 1
+    Assert-Equal 'destroyed-media detector names the show from the path' $detected[0].Show 'Show A'
+    Assert-Equal 'destroyed-media detector keeps the episode number' $detected[0].Episode 3
+    $restored = [pscustomobject]@{ Type='episode'; Show='Show A'; Season=1; Episode=3; Paths=@($keptPath) }
+    Assert-Equal 'destroyed-media detector skips an episode restored elsewhere' @(Get-PlaylistDestroyedMedia -LogDirectory $logDir -Library @($restored)).Count 0
+}
+finally { if (Test-Path -LiteralPath $lostTmp) { Remove-Item -LiteralPath $lostTmp -Recurse -Force } }
+
+$movedTmp = Join-Path ([IO.Path]::GetTempPath()) ('relocated-media-test-' + [guid]::NewGuid().ToString('N'))
+try {
+    $logDir = Join-Path $movedTmp 'logs'
+    $seasonDir = Join-Path $movedTmp 'Show B\Season 1'
+    [void][IO.Directory]::CreateDirectory($logDir)
+    [void][IO.Directory]::CreateDirectory($seasonDir)
+    $newPath = Join-Path $seasonDir 'Show.B.S01E02.mkv'
+    [IO.File]::WriteAllText($newPath, 'x')
+    $gonePath = Join-Path $seasonDir 'Show.B.S01E03.mkv'
+    $lines = @(
+        ([pscustomobject]@{ event='moved'; source=$gonePath; dest=$newPath } | ConvertTo-Json -Compress),
+        ([pscustomobject]@{ event='moved'; source=$gonePath; dest=$gonePath } | ConvertTo-Json -Compress)
+    )
+    [IO.File]::WriteAllLines((Join-Path $logDir 'moves-20261118.jsonl'), $lines)
+    $relocated = @(Get-PlaylistRelocatedMedia -LogDirectory $logDir)
+    Assert-Equal 'relocated-media detector finds a moved file that still exists' $relocated.Count 1
+    Assert-Equal 'relocated-media detector names the show from the destination' $relocated[0].Show 'Show B'
+    Assert-Equal 'relocated-media detector keeps the episode number' $relocated[0].Episode 2
+    Assert-Equal 'relocated-media detector keeps the destination path' $relocated[0].Path $newPath
+}
+finally { if (Test-Path -LiteralPath $movedTmp) { Remove-Item -LiteralPath $movedTmp -Recurse -Force } }
+
+$invGood = @()
+for ($cycle=1; $cycle -le 2; $cycle++) {
+    $invGood += @((Media ('inv-movie-a-' + $cycle)),(Media ('inv-s1-' + $cycle) 'episode' $cycle 'inv-show-1'),(Media ('inv-s2-' + $cycle) 'episode' $cycle 'inv-show-2'),
+        (Media ('inv-s3-' + $cycle) 'episode' $cycle 'inv-show-3'),(Media ('inv-s4-' + $cycle) 'episode' $cycle 'inv-show-4'),(Media ('inv-s5-' + $cycle) 'episode' $cycle 'inv-show-5'))
+}
+Assert-True 'invariant gate accepts ordered complete cycles' (Assert-PlaylistQueueInvariants -Queue $invGood -EpisodesPerMovie 5 -RotationSize 5)
+$badInvariant = $false
+try { Assert-PlaylistQueueInvariants -Queue @($invGood[0],$invGood[0]) -EpisodesPerMovie 5 -RotationSize 5 } catch { $badInvariant = $true }
+Assert-True 'invariant gate rejects duplicate identities' $badInvariant
+$badInvariant = $false
+$inverted = @((Media 'inv-movie-x'),(Media 'inv-late' 'episode' 5 'inv-show-x'),(Media 'inv-early' 'episode' 2 'inv-show-x'))
+try { Assert-PlaylistQueueInvariants -Queue $inverted -EpisodesPerMovie 5 -RotationSize 5 } catch { $badInvariant = $true }
+Assert-True 'invariant gate rejects a later episode ahead of an earlier one' $badInvariant
+$badInvariant = $false
+$tooMany = @((Media 'inv-movie-y')) + @(1..6 | ForEach-Object { Media ("inv-ep-$_") 'episode' $_ ("inv-other-$_") })
+try { Assert-PlaylistQueueInvariants -Queue $tooMany -EpisodesPerMovie 5 -RotationSize 5 } catch { $badInvariant = $true }
+Assert-True 'invariant gate rejects more than five episodes before a movie' $badInvariant
+
+$managerSource = [IO.File]::ReadAllText((Join-Path $script:TestRoot 'playlist-manager.ps1'))
+Assert-True 'manager persists re-bound keys across Queue, BaseQueue and Movies' `
+    ($managerSource.Contains("foreach (`$savedName in @('Queue', 'BaseQueue', 'Movies'))") -and $managerSource.Contains("re-keyed Plex item(s) by stable identity across Queue, BaseQueue and Movies"))
+Assert-True 'manager defers missing media without blocking the playlist' ($managerSource -match 'Deferred missing item:' -and $managerSource -match 'deferred-missing-media')
+Assert-True 'manager restores reappeared media at its saved slot' ($managerSource -match 'Insert-PlaylistQueueItem -Queue \$savedItems -Position \$insertAt' -and $managerSource -match 'restored-missing-')
+Assert-True 'manager records deferral, restoration and rebind counts in the result' `
+    ($managerSource -match 'DeferredMissing = @\(\$deferred\).Count' -and $managerSource -match 'RestoredMissing = @\(\$restored\).Count' -and $managerSource -match 'ReboundKeys = @\(\$rebound\).Count')
+Assert-True 'manager refuses duplicate identities before writing a proposal' ($managerSource -match 'Refusing to write a playlist with duplicate identities')
+Assert-True 'manager drops relocated files that Plex has not indexed yet' `
+    ($managerSource.Contains('Get-PlaylistRelocatedMedia -LogDirectory') -and
+     $managerSource.Contains('Refresh the library section; do not re-download.') -and
+     $managerSource.Contains('$downloadItems = @($downloadItems | Where-Object {') -and
+     $managerSource.Contains('$st.DownloadMissing = @($st.DownloadMissing | Where-Object {'))
+Assert-True 'manager excludes watched episodes from the download list' `
+    ($managerSource.Contains('$watchedSources = @($episodes | Where-Object { $_.Watched })') -and
+     $managerSource.Contains('$state.Retired | ForEach-Object { $_.Item } | Where-Object { $_.Watched }') -and
+     $managerSource.Contains('Get-PlaylistTvStatus $show $episodes $anchor $collectionAnchor $watchedEpisodeIds') -and
+     $managerSource.Contains('if ($wasWatched) { continue }'))
+Assert-True 'manager builds the download list from the cursor-independent missing set' `
+    ($managerSource.Contains('$toDownload = @(Get-PlaylistProp $st ''DownloadMissing'' @($st.Missing))') -and
+     $managerSource.Contains('$collectionAnchor = if ($seed.Count)') -and
+     $managerSource.Contains('Get-PlaylistTvStatus $show $episodes $anchor $collectionAnchor'))
+Assert-True 'manager refreshes the short download checklist on normal runs only' `
+    ($managerSource.Contains('Write-PlaylistDownloadList -Path $downloadPath -DownloadItems $downloadItems') -and
+     $managerSource.Contains('# Keep the short download checklist fresh on every normal run.'))
+Assert-True 'live and example configs document both missing-media files' `
+    ((Get-Content (Join-Path $script:TestRoot 'playlist.config.json') -Raw) -match '"missingMediaLedgerPath"\s*:\s*"LIBRARY-MISSING-DETAILS\.md"' -and
+     (Get-Content (Join-Path $script:TestRoot 'playlist.config.json') -Raw) -match '"downloadListPath"\s*:\s*"LIBRARY-MISSING\.md"' -and
+     (Get-Content (Join-Path $script:TestRoot 'playlist.config.example.json') -Raw) -match '"missingMediaLedgerPath"\s*:\s*"LIBRARY-MISSING-DETAILS\.md"' -and
+     (Get-Content (Join-Path $script:TestRoot 'playlist.config.example.json') -Raw) -match '"downloadListPath"\s*:\s*"LIBRARY-MISSING\.md"')
 Write-TestResult -Suite 'playlist-manager'

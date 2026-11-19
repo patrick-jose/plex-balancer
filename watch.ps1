@@ -435,6 +435,29 @@ while ($true) {
                     if ($pr.TimedOut -or $pr.ExitCode -ne 0) { Write-WatchLog 'playlist maintenance did not finish successfully; saved intent is retained for retry' 'WARN' }
                 }
             }
+
+            # Storage history is durable and independent of playlist work. It
+            # records what is on disk each cycle, so an episode that disappears
+            # can still be traced after the balancer's own logs are pruned. It is
+            # an observer: a failure here is logged and never costs the balance
+            # run or the playlist update.
+            $historyScript = Join-Path $PSScriptRoot 'storage-history.ps1'
+            if ((Get-Prop $cfg 'storageHistoryEnabled' $true) -and (Test-Path -LiteralPath $historyScript)) {
+                try {
+                    $historyArgs = @(
+                        '-ConfigPath', $ConfigPath,
+                        '-DataDirectory', (Join-Path $PSScriptRoot 'storage-history'),
+                        '-MinIntervalMinutes', [string][int](Get-Prop $cfg 'storageHistoryIntervalMinutes' 60)
+                    )
+                    if ($DryRun) { $historyArgs += '-DryRun' }
+                    Write-WatchLog 'recording storage history'
+                    $hr = Invoke-Child -Script $historyScript -ScriptArgs $historyArgs -TimeoutSeconds 600
+                    foreach ($line in $hr.Output) { if ($line) { Write-WatchLog ("  history: $line") } }
+                    if ($hr.TimedOut) { Write-WatchLog 'storage history scan was killed; the next cycle will retry' 'WARN' }
+                    elseif ($hr.ExitCode -ne 0) { Write-WatchLog 'storage history scan failed; media is untouched and the next cycle will retry' 'WARN' }
+                }
+                catch { Write-WatchLog ("storage history failed: {0}" -f $_.Exception.Message) 'WARN' }
+            }
         }
     }
     catch {

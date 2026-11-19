@@ -3,6 +3,9 @@
   "verify": "size",
   "logDir": "logs",
   "logRetentionDays": 7,
+
+  "storageHistoryEnabled": true,
+  "storageHistoryIntervalMinutes": 60,
   "copyMarginGB": 0.2,
   "maxUnitPctOfFree": 50,
   "sinkOrder": "bestFit",

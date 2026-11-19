@@ -13,6 +13,16 @@ available. Do not skip ahead or discard eligible work from earlier slots. Add on
 movie per five newly queued TV episodes, preserving the trailing cadence and the
 existing relative order/insertion point rather than appending after the movie reserve.
 
+A saved active show that is deliberately deleted from Plex (the whole series, not a
+temporary disk/key problem) is a roster vacancy, not a reason to pause the rotation.
+Drop the dead id from `ActiveIds` and from any unfinished cycle's consumed prefix,
+then promote an eligible standby (a show with an already downloaded, unwatched local
+episode) into the vacant slot so the 25-show shape is kept. If no standby has
+downloaded content, continue with the surviving shows and stop at the first blocked
+show as usual; do not hard-pause merely because fewer than 25 active shows are visible.
+A deleted id that is also a configured manual replacement target is inert until that
+config is updated.
+
 The manual queue is an EXISTING VIEWING POSITION, not a template to rebuild from
 the alphabetically first show. Preserve every imported item's order, including a
 mid-cycle head, already-queued incomplete cycles, and the existing movie tail.
@@ -132,6 +142,28 @@ Manual replacement overrides, user-confirmed thematic groups and conservative
 numbered/shared-prefix title grouping still work. TMDb collection order uses
 release/installment order, not an inferred fictional-universe timeline.
 
+`cadenceBackfill` (default `true` in `playlist.config.example.json`) makes the
+manager repair historical four-episode TV blocks on the next apply. When Plex
+deletes a show, its queued episodes disappear and leave a short block that the
+manager previously only reported. With backfill on, an eligible downloaded next
+episode is inserted immediately before the following movie so the five-episode
+cadence is restored. The inserted item respects saved cursors, known-missing and
+future episodes and the watched flag; it never duplicates an already-queued
+episode or gives one block two episodes of the same show. The substitute is
+chosen from the saved alphabetical rotation and inserted at its correct position
+in the block, and it is never a show already used elsewhere in the same
+`rotationSize`-show cycle, so a cycle keeps 25 distinct shows. If every eligible
+standby is already used in that cycle, the gap is deliberately left short rather
+than repeating a show. A show is also skipped when an earlier episode of it is
+still queued later in the playlist, so a fill can never make S02E01 play before
+S01E01. Existing order is preserved, and the filled queue becomes
+the new protected base so a later run cannot drop the inserted items. Set
+`cadenceBackfill` to `false` to report gaps
+without changing the queue. Backfills are announced as `cadence-backfill-*`
+notices in `queue.md`, `notifications.json`, `status.ps1` and `last-result.json`
+(`CadenceFills` / `UnfilledGaps`); preview mode only reports what would be filled
+and never edits the live playlist.
+
 The older read-only discovery tool remains available independently:
 
 ```powershell
@@ -199,14 +231,16 @@ rules, reports and handoff context are therefore available in this project.
 The older `playlist-preview.ps1` still requires exactly 25 selected IDs. The new
 manager supports 25 ACTIVE shows plus standby replacements. It anchors initial
 episode positions to the manual queue and persists cursors/active roster thereafter.
-Manual replacement pairs (currently Beef -> From locally) are explicit overrides,
-recorded as such, not invented TMDb completion results. With provider-confirmed
-completion and the final episode queued, an available standby can be selected in
-alphabetical order. Unknown or continuing exhausted shows pause the next round.
+Manual replacement pairs are explicit overrides, recorded as such, not invented TMDb
+completion results. With provider-confirmed completion and the final episode queued,
+an available standby can be selected in alphabetical order.
+Unknown or continuing exhausted shows pause the next round; a deliberately deleted
+active show instead opens a roster vacancy that is filled from eligible downloadable
+standbys.
 Specials (season zero) remain excluded provisionally; duplicate media versions of
 the same episode count once. Ambiguous edition matches block recovery.
 
-The initial live library had 26 shows: From is configured as standby for Beef.
+The active roster is 24 shows.
 The manager preserves the existing movie queue exactly, not merely as draw
 preferences. New movie selection stops at five-episode slot demand or a selected
 group's final entry. These bounds do not retrospectively trim the imported tail.
@@ -272,7 +306,10 @@ never delete or modify media; missing files remain under Plex refresh/recheck.
 
 Check movie boundaries through the last queued TV episode and report intervals
 with four TV episodes where five are expected. Exclude the trailing movie-only
-reserve/franchise tail so reserve movies do not create false alarms.
+reserve/franchise tail so reserve movies do not create false alarms. With
+`cadenceBackfill` enabled the manager also fills such gaps from eligible next
+downloaded episodes before the following movie (see configuration above); when
+no eligible content exists the gap is left intact and reported as `UnfilledGaps`.
 
 ## Missing playlist items and recovery
 
@@ -317,10 +354,27 @@ ratingKey or path. When an intended item is absent from Plex, or Plex still list
 it with a path that is no longer available, the manager refreshes the affected
 Plex library section and waits for the scan with a timeout. It then rereads the
 Plex library and resolves the item again by stable identity. If the item reappears,
-the managed playlist can be repaired at its intended position. If it does not,
-the manager reports the unresolved item, keeps its queue intent, and pauses
-playlist writes; it does not search the computer's drives for the old path or
-silently remove the entry. The original manual playlist is never written.
+the managed playlist can be repaired at its intended position. A changed
+ratingKey with the same stable identity is rebound in place and persisted to
+`Queue`, `BaseQueue` and `Movies`, so a Plex re-key is never confused with missing
+media.
+
+If a section refresh still cannot find the item, the manager **defers** it: the
+saved slot moves to `state.Missing`, a row is written to `LIBRARY-MISSING-DETAILS.md`
+with that slot, and synchronization continues without the dead reference. The short
+"what to download" checklist in `LIBRARY-MISSING.md` is regenerated on every normal run
+from TMDb releases versus the local Plex library, starting at each show's collection
+start rather than the rotation cursor — so aired episodes already passed in an earlier
+cycle are still listed when their file is missing. Watched episodes are excluded from
+that list: a viewed item whose file was later retired is not offered for download again.
+Destructive move-log events are folded in as a safety net. Deferring is
+not deletion — no media or source-playlist entry is touched, and the slot is not
+filled by another show. On every later run the manager checks deferred identities
+against Plex first; when a refresh makes one reappear, it is restored to its saved
+slot and the ledger row moves to the resolved-history section. Only an *ambiguous*
+identity match (more than one library item with the same identity) pauses writes,
+because choosing an arbitrary edition would be unsafe. The original manual
+playlist is never written.
 
 Every apply saves intent and snapshots BEFORE any mutation and verifies the full
 result afterward. If Plex returns success for an ineffective item move, the

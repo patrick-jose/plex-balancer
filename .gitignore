@@ -3,6 +3,12 @@
 # file you have ever moved.
 logs/*
 
+# Durable per-file storage history. Unlike logs/, this is deliberately never
+# pruned: it is the long-term record of where each file was, so a file that goes
+# missing can be traced. It names every media path on this machine, so it stays
+# local.
+storage-history/*
+
 # Working copies, .bak snapshots and scratch diagnostics. Nothing here is part of
 # the tool - it is what you keep while changing something and delete when it is
 # done. Ignored so none of it can reach a published repo.
